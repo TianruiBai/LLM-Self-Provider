@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign in — Self-hosted Provider</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,300..700,0..1,-50..200&display=block" />
+<link rel="stylesheet" href="/ui/style.css" />
+<style>
+  body { background: var(--bg); color: var(--fg); margin: 0; min-height: 100vh; display: grid; place-items: center; }
+  .login-card {
+    width: 100%; max-width: 420px;
+    background: var(--bg-1); border: 1px solid var(--border); border-radius: 12px;
+    padding: 28px 28px 22px; box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+  }
+  .login-card h1 { font-size: 18px; margin: 0 0 4px; }
+  .login-card .sub { color: var(--fg-dim); font-size: 12.5px; margin-bottom: 18px; }
+  .login-card .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .login-card label { font-size: 12px; color: var(--fg-dim); }
+  .login-card input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 9px 11px; font-size: 13.5px; outline: none;
+  }
+  .login-card input:focus { border-color: var(--accent); }
+  .login-card .actions { display: flex; gap: 8px; margin-top: 14px; }
+  .login-card .actions button { flex: 1; }
+  .login-card .err { color: #f47c7c; font-size: 12px; min-height: 16px; margin-top: 4px; }
+  .login-card .ok { color: #6dd6a3; font-size: 12px; min-height: 16px; margin-top: 4px; }
+  .login-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .login-tabs button {
+    flex: 1; padding: 7px 10px; font-size: 12px;
+    background: transparent; border: 1px solid var(--border); color: var(--fg-dim);
+    border-radius: 6px; cursor: pointer;
+  }
+  .login-tabs button.active { background: var(--bg-2); color: var(--fg); border-color: var(--accent); }
+  .login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .login-brand .logo { font-size: 22px; }
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="logo">⬢</div>
+      <div>
+        <div style="font-weight:600">Self-hosted Provider</div>
+        <div class="sub" style="margin:0">llama.cpp · CUDA · multi-user</div>
+      </div>
+    </div>
+
+    <!-- Mode = login (default) or bootstrap (auto-switched when no users exist) -->
+    <h1 id="title">Sign in</h1>
+    <div class="sub" id="subtitle">Use your account password to access the web UI.</div>
+
+    <form id="login-form">
+      <div class="field">
+        <label for="lg-username">Username</label>
+        <input id="lg-username" type="text" autocomplete="username" required />
+      </div>
+      <div class="field">
+        <label for="lg-password">Password</label>
+        <input id="lg-password" type="password" autocomplete="current-password" required />
+      </div>
+      <div class="field" id="lg-totp-field" hidden>
+        <label for="lg-totp">2FA code</label>
+        <input id="lg-totp" type="text" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="6-digit code or recovery code" />
+      </div>
+      <div class="field" id="lg-email-field" hidden>
+        <label for="lg-email">Admin email (optional)</label>
+        <input id="lg-email" type="email" autocomplete="email" />
+      </div>
+      <div class="actions">
+        <button id="lg-submit" type="submit" class="primary">Sign in</button>
+      </div>
+      <div class="err" id="lg-err"></div>
+      <div class="ok" id="lg-ok"></div>
+    </form>
+  </div>
+
+<script>
+"use strict";
+
+const $ = (s) => document.querySelector(s);
+const errEl = $("#lg-err"), okEl = $("#lg-ok");
+let mode = "login";   // 'login' | 'bootstrap'
+let totpRequired = false;
+
+function setError(msg) { errEl.textContent = msg || ""; okEl.textContent = ""; }
+function setOk(msg)    { okEl.textContent  = msg || ""; errEl.textContent = ""; }
+
+async function detectMode() {
+  try {
+    const r = await fetch("/auth/me-anonymous");
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.authenticated) {
+      // Already signed in — go to the app.
+      window.location.replace("/ui/");
+      return;
+    }
+    if (j.bootstrap) {
+      mode = "bootstrap";
+      $("#title").textContent = "Create the first admin";
+      $("#subtitle").textContent = "No accounts exist yet. The first user is automatically promoted to administrator.";
+      $("#lg-submit").textContent = "Create admin";
+      $("#lg-email-field").hidden = false;
+    }
+  } catch {}
+}
+
+$("#login-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  setError("");
+  const username = $("#lg-username").value.trim();
+  const password = $("#lg-password").value;
+  if (!username || !password) { setError("Username and password required."); return; }
+  if (password.length < 8 && mode === "bootstrap") { setError("Password must be at least 8 characters."); return; }
+
+  const btn = $("#lg-submit");
+  btn.disabled = true;
+  try {
+    if (mode === "bootstrap") {
+      const r = await fetch("/auth/bootstrap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username, password,
+          email: $("#lg-email").value.trim() || null,
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.detail || "Bootstrap failed."); return; }
+      setOk("Admin created — entering app…");
+      window.location.replace("/ui/");
+      return;
+    }
+
+    // login mode
+    const body = { username, password };
+    if (totpRequired) body.totp = $("#lg-totp").value.trim();
+    const r = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.totp_required) {
+      totpRequired = true;
+      $("#lg-totp-field").hidden = false;
+      $("#lg-totp").focus();
+      setOk("Two-factor authentication required.");
+      return;
+    }
+    if (!r.ok || !j.ok) {
+      setError(j.detail || "Sign-in failed.");
+      return;
+    }
+    window.location.replace("/ui/");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+detectMode();
+</script>
+</body>
+</html>
