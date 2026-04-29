@@ -11,8 +11,6 @@ binary: "C:/Users/Tass/Documents/DS-V4-llama/llama.cpp-deepseek-v4-flash/build-c
 args:
   - "--ctx-size"
   - "128000"
-  - "--device"
-  - "CUDA1"
   - "--split-mode"
   - "none"
   - "--fit"

@@ -8,8 +8,6 @@ path: "C:/Users/Tass/.lmstudio/models/unsloth/MiniMax-M2.7-GGUF/MiniMax-M2.7-UD-
 args:
   - "--ctx-size"
   - "131072"
-  - "--device"
-  - "CUDA1"
   - "--split-mode"
   - "none"
   - "--n-gpu-layers"

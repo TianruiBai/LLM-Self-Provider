@@ -14,8 +14,6 @@ mmproj: "C:/Users/Tass/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/m
 args:
   - "--ctx-size"
   - "65536"
-  - "--device"
-  - "CUDA0"
   - "--n-gpu-layers"
   - "999"
   - "--batch-size"

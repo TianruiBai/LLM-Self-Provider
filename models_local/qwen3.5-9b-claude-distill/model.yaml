@@ -7,8 +7,6 @@ path: "C:/Users/Tass/.lmstudio/models/Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reason
 args:
   - "--ctx-size"
   - "32768"
-  - "--device"
-  - "CUDA1"
   - "--fit"
   - "on"
   - "--fit-target"
