@@ -249,6 +249,10 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     from provider.auth_routes import router as _auth_router
     app.include_router(_auth_router)
 
+    # /auth/oidc router: OIDC sign-in (GitHub + Google + generic).
+    from provider.oidc_routes import router as _oidc_router
+    app.include_router(_oidc_router)
+
     proxy_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
 
     # ---------------- health ----------------

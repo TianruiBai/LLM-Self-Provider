@@ -75,6 +75,10 @@
       <div class="err" id="lg-err"></div>
       <div class="ok" id="lg-ok"></div>
     </form>
+    <div id="oidc-block" hidden style="margin-top:18px;border-top:1px solid var(--border);padding-top:14px;">
+      <div class="sub" style="margin-bottom:8px;">Or sign in with</div>
+      <div id="oidc-buttons" style="display:flex;flex-direction:column;gap:6px;"></div>
+    </div>
   </div>
 
 <script>
@@ -162,6 +166,29 @@ $("#login-form").addEventListener("submit", async (ev) => {
 });
 
 detectMode();
+
+async function loadOidcProviders() {
+  try {
+    const r = await fetch("/auth/oidc/providers");
+    if (!r.ok) return;
+    const j = await r.json();
+    const providers = (j && j.providers) || [];
+    if (!providers.length) return;
+    const block = document.getElementById("oidc-block");
+    const wrap = document.getElementById("oidc-buttons");
+    wrap.innerHTML = "";
+    for (const p of providers) {
+      const a = document.createElement("a");
+      a.href = `/auth/oidc/${encodeURIComponent(p.name)}/start`;
+      a.className = "primary";
+      a.style.cssText = "text-align:center;text-decoration:none;padding:6px 10px;border-radius:6px;";
+      a.textContent = `Continue with ${p.label}`;
+      wrap.appendChild(a);
+    }
+    block.hidden = false;
+  } catch {}
+}
+loadOidcProviders();
 </script>
 </body>
 </html>

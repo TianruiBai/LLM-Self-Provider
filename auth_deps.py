@@ -170,6 +170,7 @@ class AuthMiddleware:
         "/auth/login",
         "/auth/login-totp",
         "/auth/oauth/",
+        "/auth/oidc/",
         "/auth/bootstrap",
         "/static/",
         "/favicon.ico",
