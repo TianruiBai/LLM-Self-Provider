@@ -299,6 +299,12 @@ def _discover_lmstudio(explicit: str | None) -> list[ModelConfig]:
                     path=str(weights[0]),
                     mmproj=str(mmproj[0]) if mmproj else None,
                     folder=str(model_dir),
+                    # In-container deployment: GGUFs are run by a swappable
+                    # sibling vLLM container managed by ``provider.vllm_runner``.
+                    # The sentinel endpoint tells lifecycle to invoke the runner
+                    # rather than treat it as a static URL.
+                    backend="vllm",
+                    endpoint="vllm-runner://chat",
                 )
             )
     if out:

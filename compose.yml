@@ -9,10 +9,14 @@
 #   PROVIDER_BOOTSTRAP_ADMIN_USER — first admin username, created on first run
 #   PROVIDER_BOOTSTRAP_ADMIN_PASSWORD
 #   HF_TOKEN                       — optional, required for gated models
-#   VLLM_CHAT_MODEL                — e.g. Qwen/Qwen3-30B-A3B-Instruct-2507
-#   VLLM_EMBED_MODEL               — e.g. Qwen/Qwen3-Embedding-8B
-#   VLLM_VISION_MODEL              — e.g. google/gemma-3-4b-it
+#   VLLM_CHAT_MODEL                — HF repo id; leave blank to skip vllm-chat
+#   VLLM_EMBED_MODEL               — HF repo id; leave blank to skip vllm-embed
+#   VLLM_VISION_MODEL              — HF repo id; leave blank to skip vllm-vision
 #   VLLM_GPU_UTIL                  — 0..1, default 0.85
+#
+# By default `docker compose up` only starts the gateway. To also start the
+# vLLM workers (after setting the *_MODEL env vars), use:
+#     docker compose --profile vllm up -d
 #
 # A typical layout uses one Docker volume for HF cache, one for Lance, and one
 # for the SQLite control DB so backups can target a single tree.
@@ -20,6 +24,7 @@
 services:
   vllm-chat:
     image: vllm/vllm-openai:v0.6.0
+    profiles: ["vllm"]
     deploy:
       resources:
         reservations:
@@ -31,7 +36,7 @@ services:
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
     command: >
-      --model ${VLLM_CHAT_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}
+      --model ${VLLM_CHAT_MODEL}
       --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
       --max-model-len 32768
       --enable-auto-tool-choice
@@ -48,6 +53,7 @@ services:
 
   vllm-embed:
     image: vllm/vllm-openai:v0.6.0
+    profiles: ["vllm"]
     deploy:
       resources:
         reservations:
@@ -59,7 +65,7 @@ services:
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
     command: >
-      --model ${VLLM_EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}
+      --model ${VLLM_EMBED_MODEL}
       --task embed
       --gpu-memory-utilization 0.5
     volumes:
@@ -74,6 +80,7 @@ services:
 
   vllm-vision:
     image: vllm/vllm-openai:v0.6.0
+    profiles: ["vllm"]
     deploy:
       resources:
         reservations:
@@ -85,7 +92,7 @@ services:
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
     command: >
-      --model ${VLLM_VISION_MODEL:-google/gemma-3-4b-it}
+      --model ${VLLM_VISION_MODEL}
       --gpu-memory-utilization 0.4
       --max-model-len 8192
     volumes:
@@ -102,11 +109,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      vllm-chat:
-        condition: service_healthy
-      vllm-embed:
-        condition: service_healthy
+    # Allow the gateway to reach host-side backends (e.g. LM Studio on
+    # http://host.docker.internal:1234). On Linux this gets translated to
+    # the host gateway IP automatically; on Docker Desktop it's a no-op.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       PROVIDER_AUTH_PEPPER: ${PROVIDER_AUTH_PEPPER:?must be set}
       PROVIDER_MASTER_KEY: ${PROVIDER_MASTER_KEY:?must be set}
@@ -119,6 +126,17 @@ services:
       PROVIDER_OIDC_GITHUB_CLIENT_SECRET: ${PROVIDER_OIDC_GITHUB_CLIENT_SECRET:-}
       PROVIDER_OIDC_GOOGLE_CLIENT_ID: ${PROVIDER_OIDC_GOOGLE_CLIENT_ID:-}
       PROVIDER_OIDC_GOOGLE_CLIENT_SECRET: ${PROVIDER_OIDC_GOOGLE_CLIENT_SECRET:-}
+      # vLLM sibling-container runner: the gateway shells the docker daemon
+      # via the bind-mounted socket to start a swappable vllm/vllm-openai
+      # container per slot (chat / embed). The sibling needs the same paths
+      # the gateway discovered, so we forward the host LM Studio dir.
+      LMSTUDIO_HOST_DIR: ${LMSTUDIO_DIR:-${HOME:-/root}/.lmstudio/models}
+      DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-provider}_default
+      HF_CACHE_VOLUME: ${COMPOSE_PROJECT_NAME:-provider}_hf-cache
+      VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+      VLLM_GPU_UTIL: ${VLLM_GPU_UTIL:-0.85}
+      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      HF_TOKEN: ${HF_TOKEN:-}
     ports:
       - "8088:8088"
     volumes:
@@ -129,6 +147,9 @@ services:
       # can auto-discover GGUFs without ever mutating them. Set
       # ``LMSTUDIO_DIR`` in .env to override the default ``$HOME/.lmstudio/models``.
       - ${LMSTUDIO_DIR:-${HOME:-/root}/.lmstudio/models}:/lmstudio:ro
+      # Docker socket so the gateway can manage swappable sibling vLLM
+      # containers (see provider/vllm_runner.py).
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
       interval: 30s

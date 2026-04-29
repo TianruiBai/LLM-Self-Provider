@@ -21,6 +21,7 @@ from typing import Optional
 import httpx
 
 from .registry import ModelConfig, ProviderConfig
+from .vllm_runner import VllmRunner
 
 log = logging.getLogger("provider.lifecycle")
 
@@ -94,6 +95,8 @@ class LifecycleManager:
         # can publish an activity event. Set by ``LifecycleManager.set_idle_callback``.
         self._idle_callback = None
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
+        # Sibling-container vLLM runner for swappable LM Studio GGUFs.
+        self._vllm = VllmRunner()
 
     # ---------------- public API ----------------
 
@@ -127,17 +130,20 @@ class LifecycleManager:
         self._idle_callback = cb
 
     async def ensure_chat(self, model_id: str) -> str:
-        """Ensure the named chat model is the active one. Returns base URL."""
+        """Ensure the named chat model is the active one. Returns base URL.
+
+        Any non-embedding model is accepted as a chat target: ``chat``,
+        ``vision`` (multimodal), and ``sub_agent`` models all expose
+        ``/v1/chat/completions`` and can serve user traffic directly.
+        """
         cfg = self.cfg.by_id(model_id)
-        if cfg.kind != "chat":
-            raise ValueError(f"Model {model_id!r} is not a chat model")
+        if cfg.kind == "embedding":
+            raise ValueError(f"Model {model_id!r} is an embedding model and cannot serve chat")
 
         # Phase C — vLLM-backed models live as a separate Docker service.
         # We never spawn a child for them; we just hand the endpoint back.
         if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            ep = cfg.endpoint
-            if not ep:
-                raise RuntimeError(f"vLLM model {model_id!r} has no endpoint configured")
+            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
             # If a llama-server child is currently active, stop it so VRAM
             # frees up before vLLM gets traffic.
             async with self._chat_lock:
@@ -176,9 +182,8 @@ class LifecycleManager:
         if cfg is None:
             raise RuntimeError("No sub_agent model configured")
         if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            if not cfg.endpoint:
-                raise RuntimeError("vLLM sub-agent has no endpoint configured")
-            return cfg.endpoint.rstrip("/")
+            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
+            return ep.rstrip("/")
         async with self._sub_agent_lock:
             if self._sub_agent is not None and self._sub_agent.alive():
                 return self._sub_agent_base_url()
@@ -191,9 +196,8 @@ class LifecycleManager:
         if cfg is None:
             raise RuntimeError("No embedding model configured")
         if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            if not cfg.endpoint:
-                raise RuntimeError("vLLM embedder has no endpoint configured")
-            return cfg.endpoint.rstrip("/")
+            ep = await self._resolve_vllm_endpoint(cfg, slot="embed")
+            return ep.rstrip("/")
         async with self._embed_lock:
             self._embed_last_use = time.time()
             if self._embed is not None and self._embed.alive():
@@ -207,9 +211,8 @@ class LifecycleManager:
         if cfg is None:
             raise RuntimeError("No vision model configured")
         if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            if not cfg.endpoint:
-                raise RuntimeError("vLLM vision model has no endpoint configured")
-            return cfg.endpoint.rstrip("/")
+            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
+            return ep.rstrip("/")
         async with self._vision_lock:
             self._vision_last_use = time.time()
             if self._vision is not None and self._vision.alive():
@@ -223,6 +226,30 @@ class LifecycleManager:
 
     def touch_embedder(self) -> None:
         self._embed_last_use = time.time()
+
+    async def _resolve_vllm_endpoint(self, cfg: ModelConfig, slot: str) -> str:
+        """Return the base URL for a ``backend=="vllm"`` model.
+
+        If ``cfg.endpoint`` is a ``vllm-runner://`` sentinel, ask the
+        sibling-container runner to ensure a vLLM container is up with the
+        requested GGUF; otherwise just hand the static endpoint back.
+        Per-model overrides (``ctx_size``, ``extra_args``) from the
+        ``model_publish`` table are forwarded to the runner.
+        """
+        ep = cfg.endpoint
+        runner_slot = self._vllm.parse_endpoint(ep)
+        if runner_slot is not None:
+            override = _load_model_override(cfg.id)
+            return await self._vllm.ensure(
+                slot,
+                cfg.path,
+                cfg.kind,
+                extra_args=override.get("extra_args"),
+                ctx_size=override.get("ctx_size"),
+            )
+        if not ep:
+            raise RuntimeError(f"vLLM model {cfg.id!r} has no endpoint configured")
+        return ep
 
     async def unload_embedder(self) -> Optional[str]:
         async with self._embed_lock:

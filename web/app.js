@@ -249,7 +249,7 @@ async function refreshModels() {
       const admin = state.modelAdmin && state.modelAdmin[m.id];
       const missing = admin && admin.path_exists === false;
       opt.textContent = `${m.id}${tag}${missing ? " — not downloaded" : ""}`;
-      if (m.kind === "embedding" || m.kind === "vision") opt.disabled = true;
+      if (m.kind === "embedding") opt.disabled = true;
       sel.appendChild(opt);
     }
     if (prev) sel.value = prev;

@@ -799,8 +799,8 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             mcfg = cfg.by_id(model_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-        if mcfg.kind not in ("chat", "sub_agent"):
-            raise HTTPException(status_code=400, detail=f"Model {model_id!r} is not a chat-capable model")
+        if mcfg.kind == "embedding":
+            raise HTTPException(status_code=400, detail=f"Model {model_id!r} is an embedding model and cannot serve chat")
 
         # Non-admins may only invoke models the admin has explicitly published.
         if not _viewer_is_admin(req):
@@ -877,6 +877,8 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         # of its own but the request carries image / audio parts, route those
         # through the small Gemma helper on CUDA0 to extract a text
         # description first, then forward the rewritten messages upstream.
+        # Skip when the user picked a multimodal model directly as their
+        # chat target — it already handles images natively.
         vision_used: list[dict[str, Any]] = []
         if (
             chat

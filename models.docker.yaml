@@ -23,21 +23,8 @@ rag:
   chunk_chars: 1200
   chunk_overlap: 150
 
-models:
-  - id: chat
-    kind: chat
-    path: ""
-    backend: vllm
-    endpoint: http://vllm-chat:8000
-
-  - id: embedding
-    kind: embedding
-    path: ""
-    backend: vllm
-    endpoint: http://vllm-embed:8000
-
-  - id: vision
-    kind: vision
-    path: ""
-    backend: vllm
-    endpoint: http://vllm-vision:8000
+# No default models. The admin configures chat / embedding / vision from the
+# webui after selecting from the auto-discovered LM Studio GGUFs (read-only
+# mounted at /lmstudio) or by adding a vLLM endpoint when the ``vllm`` compose
+# profile is active.
+models: []

@@ -46,6 +46,7 @@
           <button class="acct-tab" data-acct="keys">API keys</button>
           <button class="acct-tab" data-acct="2fa">2FA</button>
           <button class="acct-tab" data-acct="admin" id="acct-tab-admin" hidden>Admin</button>
+          <button class="acct-tab" data-acct="models" id="acct-tab-models" hidden>Models</button>
         </nav>
         <div class="acct-body">
           <!-- profile -->
@@ -140,6 +141,15 @@
               <button class="ghost" id="acct-audit-next" type="button">Next ›</button>
             </div>
           </section>
+
+          <!-- models -->
+          <section class="acct-pane" data-pane="models">
+            <div class="acct-admin-actions">
+              <span class="hint">Publish, label, and tune every discovered model. Changes take effect on the next swap.</span>
+              <button class="ghost icon-btn" id="acct-models-refresh" type="button" title="Refresh"><span class="mi">refresh</span></button>
+            </div>
+            <div id="acct-models-list"></div>
+          </section>
         </div>
       </div>`;
     document.body.appendChild(el);
@@ -158,6 +168,7 @@
       if (which === "keys")  loadKeys();
       if (which === "2fa")   loadProfile();
       if (which === "admin") loadAdmin();
+      if (which === "models") loadModels();
     }));
 
     // wire actions
@@ -169,6 +180,7 @@
     $("#acct-2fa-disable").addEventListener("click", disableTotp);
     $("#acct-2fa-recovery").addEventListener("click", regenRecovery);
     $("#acct-admin-refresh").addEventListener("click", loadAdmin);
+    $("#acct-models-refresh").addEventListener("click", loadModels);
     $("#acct-admin-newuser").addEventListener("click", adminCreateUser);
     $("#acct-audit-refresh").addEventListener("click", () => { _audit.offset = 0; loadAudit(); });
     $("#acct-audit-prev").addEventListener("click", () => { _audit.offset = Math.max(0, _audit.offset - _audit.limit); loadAudit(); });
@@ -192,6 +204,7 @@
       $("#acct-role").textContent = _me.role;
       $("#acct-via").textContent = (await (await fetch("/auth/me")).json()).via || "—";
       $("#acct-tab-admin").hidden = _me.role !== "admin";
+      $("#acct-tab-models").hidden = _me.role !== "admin";
       $("#acct-2fa-off").hidden = !!_me.totp_enabled;
       $("#acct-2fa-on").hidden  = !_me.totp_enabled;
       // Update topbar pill if it exists.
@@ -504,6 +517,143 @@
         await fetch(`/auth/sessions/${b.dataset.kill}`, {method:"DELETE"});
         loadAdminSessions();
       }));
+  }
+
+  // -------------------------------------------------------- models admin
+  async function loadModels() {
+    if (!_me || _me.role !== "admin") return;
+    const wrap = $("#acct-models-list");
+    if (!wrap) return;
+    wrap.innerHTML = `<p class="hint">Loading…</p>`;
+    let models = [];
+    try {
+      const r = await fetch("/admin/models");
+      if (!r.ok) { wrap.innerHTML = `<p class="hint err">Failed to load models (${r.status}).</p>`; return; }
+      models = (await r.json()).models || [];
+    } catch (e) {
+      wrap.innerHTML = `<p class="hint err">${escapeHtml(String(e))}</p>`;
+      return;
+    }
+
+    // Pull each model's full config in parallel.
+    const cfgs = await Promise.all(models.map(async m => {
+      try {
+        const r = await fetch(`/admin/models/${encodeURIComponent(m.id)}/config`);
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }));
+
+    wrap.innerHTML = models.map((m, i) => {
+      const c = cfgs[i] || {};
+      const extra = (c.extra_args || []).join("\n");
+      const sp = c.system_prompt || "";
+      const ctx = c.ctx_size || "";
+      const yamlArgs = (c.yaml_args || []).join(" ");
+      return `
+      <details class="acct-model-row" data-id="${escapeHtml(m.id)}">
+        <summary>
+          <span class="mono" style="font-weight:600">${escapeHtml(m.id)}</span>
+          <span class="acct-pillbox">${escapeHtml(m.kind)}</span>
+          <span class="acct-pillbox">${escapeHtml(m.backend || "llama_cpp")}</span>
+          ${m.published ? `<span class="acct-pillbox" style="background:#16a34a33;color:#86efac">published</span>` : `<span class="acct-pillbox">draft</span>`}
+          ${m.label ? `<span class="hint">"${escapeHtml(m.label)}"</span>` : ""}
+        </summary>
+        <div class="acct-model-body">
+          <div class="hint mono" style="font-size:11px;word-break:break-all">${escapeHtml(m.path || "")}</div>
+          ${yamlArgs ? `<div class="hint">YAML args: <code>${escapeHtml(yamlArgs)}</code></div>` : ""}
+          <div class="acct-grid" style="grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+            <label>Label (display name)
+              <input type="text" data-field="label" value="${escapeHtml(m.label || "")}" placeholder="e.g. Qwen3 35B (chat)">
+            </label>
+            <label>Context size (--max-model-len / -c)
+              <input type="number" data-field="ctx_size" value="${escapeHtml(String(ctx))}" placeholder="(default)">
+            </label>
+          </div>
+          <label style="margin-top:8px">Extra runtime args (one per token, e.g. <code>--tokenizer</code> on one line, value on next)
+            <textarea data-field="extra_args" rows="5" placeholder="--tokenizer&#10;Qwen/Qwen3-30B-A3B&#10;--tensor-parallel-size&#10;1">${escapeHtml(extra)}</textarea>
+          </label>
+          <label style="margin-top:8px">System prompt (prepended for this model)
+            <textarea data-field="system_prompt" rows="3" placeholder="(none)">${escapeHtml(sp)}</textarea>
+          </label>
+          <div class="acct-admin-actions" style="justify-content:flex-end;margin-top:8px">
+            <button class="ghost" data-act="toggle-publish">${m.published ? "Unpublish" : "Publish"}</button>
+            <button class="primary" data-act="save">Save</button>
+          </div>
+          <div class="acct-msg" data-msg></div>
+        </div>
+      </details>`;
+    }).join("") || `<p class="hint">No models discovered.</p>`;
+
+    wrap.querySelectorAll(".acct-model-row").forEach(row => {
+      const id = row.dataset.id;
+      const get = sel => row.querySelector(sel);
+      get('button[data-act="save"]').addEventListener("click", () => saveModelConfig(id, row));
+      get('button[data-act="toggle-publish"]').addEventListener("click", () => togglePublish(id, row));
+    });
+  }
+
+  async function saveModelConfig(id, row) {
+    const msgEl = row.querySelector("[data-msg]");
+    const f = sel => row.querySelector(sel);
+    const ctxRaw = f('input[data-field="ctx_size"]').value.trim();
+    const labelRaw = f('input[data-field="label"]').value.trim();
+    const extraRaw = f('textarea[data-field="extra_args"]').value;
+    const spRaw = f('textarea[data-field="system_prompt"]').value;
+    const extra_args = extraRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const body = {
+      ctx_size: ctxRaw ? parseInt(ctxRaw, 10) : null,
+      extra_args,
+      system_prompt: spRaw || null,
+    };
+    msgEl.textContent = "Saving…"; msgEl.className = "acct-msg";
+    try {
+      const r = await fetch(`/admin/models/${encodeURIComponent(id)}/config`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        msgEl.textContent = `Save failed: ${t}`;
+        msgEl.classList.add("err");
+        return;
+      }
+      // Update label separately if it changed (publish endpoint takes label).
+      if (labelRaw !== undefined) {
+        await fetch(`/admin/models/${encodeURIComponent(id)}/publish`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({label: labelRaw || null}),
+        });
+      }
+      msgEl.textContent = "Saved. Will apply on the next model swap.";
+      msgEl.classList.add("ok");
+    } catch (e) {
+      msgEl.textContent = `Error: ${e}`;
+      msgEl.classList.add("err");
+    }
+  }
+
+  async function togglePublish(id, row) {
+    const msgEl = row.querySelector("[data-msg]");
+    const summary = row.querySelector("summary");
+    const isPublished = summary.innerHTML.includes("published");
+    const url = isPublished
+      ? `/admin/models/${encodeURIComponent(id)}/unpublish`
+      : `/admin/models/${encodeURIComponent(id)}/publish`;
+    const labelRaw = row.querySelector('input[data-field="label"]').value.trim();
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: isPublished ? "{}" : JSON.stringify({label: labelRaw || null}),
+    });
+    if (!r.ok) {
+      msgEl.textContent = `Failed: ${await r.text()}`;
+      msgEl.classList.add("err");
+      return;
+    }
+    loadModels();
   }
 
   // -------------------------------------------------------- helpers
