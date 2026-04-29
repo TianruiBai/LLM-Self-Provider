@@ -217,6 +217,14 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
 
     app.add_middleware(_AccessLogMiddleware)
 
+    # Audit logging middleware: writes one row to ``request_audit`` per
+    # protected request. Must be installed *before* AuthMiddleware so that
+    # AuthMiddleware ends up wrapping it (i.e. actor is populated by the time
+    # AuditMiddleware reads it). Order in code: CORS, AccessLog, Audit, Auth
+    # → execution: Auth → Audit → AccessLog → CORS → app.
+    from provider.audit import AuditMiddleware
+    app.add_middleware(AuditMiddleware)
+
     # Authentication middleware: resolves the caller (Bearer API key or
     # session cookie) onto ``request.state.actor`` and rejects unauthenticated
     # access to protected route prefixes (/v1/*, /admin/*, /rag/*, /events,

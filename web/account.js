@@ -119,6 +119,26 @@
             <table class="acct-table" id="acct-allkeys"></table>
             <h3 style="margin-top:16px">Active sessions</h3>
             <table class="acct-table" id="acct-sessions"></table>
+            <h3 style="margin-top:16px">Request audit</h3>
+            <div class="acct-admin-actions">
+              <select id="acct-audit-window">
+                <option value="3600">last hour</option>
+                <option value="86400" selected>last 24h</option>
+                <option value="604800">last 7d</option>
+                <option value="">all</option>
+              </select>
+              <input id="acct-audit-path" type="text" placeholder="path prefix (e.g. /v1/chat)" />
+              <input id="acct-audit-ip"   type="text" placeholder="IP" style="max-width:140px" />
+              <input id="acct-audit-status" type="text" placeholder="status (e.g. 401)" style="max-width:120px" />
+              <button class="ghost" id="acct-audit-refresh" type="button">Apply</button>
+              <span class="hint" id="acct-audit-meta" style="margin-left:auto"></span>
+            </div>
+            <div id="acct-audit-summary" class="acct-audit-summary"></div>
+            <table class="acct-table" id="acct-audit"></table>
+            <div class="acct-admin-actions" style="justify-content:flex-end">
+              <button class="ghost" id="acct-audit-prev" type="button">‹ Prev</button>
+              <button class="ghost" id="acct-audit-next" type="button">Next ›</button>
+            </div>
           </section>
         </div>
       </div>`;
@@ -150,6 +170,9 @@
     $("#acct-2fa-recovery").addEventListener("click", regenRecovery);
     $("#acct-admin-refresh").addEventListener("click", loadAdmin);
     $("#acct-admin-newuser").addEventListener("click", adminCreateUser);
+    $("#acct-audit-refresh").addEventListener("click", () => { _audit.offset = 0; loadAudit(); });
+    $("#acct-audit-prev").addEventListener("click", () => { _audit.offset = Math.max(0, _audit.offset - _audit.limit); loadAudit(); });
+    $("#acct-audit-next").addEventListener("click", () => { _audit.offset += _audit.limit; loadAudit(); });
   }
 
   function openModal() { ensureModal(); $("#acct-modal").hidden = false; loadProfile(); }
@@ -302,7 +325,78 @@
   // -------------------------------------------------------- admin
   async function loadAdmin() {
     if (!_me || _me.role !== "admin") return;
-    await Promise.all([loadAdminUsers(), loadAdminKeys(), loadAdminSessions()]);
+    await Promise.all([loadAdminUsers(), loadAdminKeys(), loadAdminSessions(), loadAudit(), loadAuditSummary()]);
+  }
+
+  // -------------------------------------------------------- audit
+  const _audit = { limit: 100, offset: 0 };
+
+  function _auditFilters() {
+    const win = $("#acct-audit-window").value;
+    const path = $("#acct-audit-path").value.trim();
+    const ip = $("#acct-audit-ip").value.trim();
+    const status = $("#acct-audit-status").value.trim();
+    const params = new URLSearchParams();
+    if (win) params.set("since", String(Math.floor(Date.now()/1000) - parseInt(win, 10)));
+    if (path) params.set("path_prefix", path);
+    if (ip) params.set("ip", ip);
+    if (status) {
+      const n = parseInt(status, 10);
+      if (!isNaN(n)) { params.set("status_min", String(n)); params.set("status_max", String(n)); }
+    }
+    return params;
+  }
+
+  async function loadAudit() {
+    const params = _auditFilters();
+    params.set("limit",  String(_audit.limit));
+    params.set("offset", String(_audit.offset));
+    const r = await fetch("/auth/admin/audit?" + params.toString());
+    if (!r.ok) return;
+    const j = await r.json();
+    const tbl = $("#acct-audit");
+    tbl.innerHTML = `
+      <thead><tr><th>Time</th><th>User</th><th>Key</th><th>IP</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>In/Out</th></tr></thead>
+      <tbody>${j.rows.map(r => `
+        <tr class="audit-${r.status >= 500 ? "err" : r.status >= 400 ? "warn" : "ok"}">
+          <td class="mono" style="white-space:nowrap">${fmtTs(r.ts)}</td>
+          <td>${escapeHtml(r.username || "")}</td>
+          <td>${r.key_prefix ? `<span class="mono" title="${escapeHtml(r.key_name||"")}">${escapeHtml(r.key_prefix)}…</span>` : ""}</td>
+          <td class="mono">${escapeHtml(r.ip || "")}</td>
+          <td>${escapeHtml(r.method)}</td>
+          <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(r.path)}">${escapeHtml(r.path)}</td>
+          <td>${r.status}</td>
+          <td>${r.duration_ms}</td>
+          <td class="mono" style="font-size:10.5px">${(r.bytes_in||0)}/${(r.bytes_out||0)}</td>
+        </tr>`).join("")}
+      </tbody>`;
+    const meta = $("#acct-audit-meta");
+    if (meta) {
+      const start = j.total ? j.offset + 1 : 0;
+      const end = Math.min(j.total, j.offset + j.rows.length);
+      meta.textContent = `${start}–${end} of ${j.total}`;
+    }
+  }
+
+  async function loadAuditSummary() {
+    const params = new URLSearchParams();
+    const win = $("#acct-audit-window").value;
+    if (win) params.set("since", String(Math.floor(Date.now()/1000) - parseInt(win, 10)));
+    const r = await fetch("/auth/admin/audit/summary?" + params.toString());
+    if (!r.ok) return;
+    const j = await r.json();
+    const el = $("#acct-audit-summary");
+    if (!el) return;
+    const totalReq = j.by_status.reduce((s, x) => s + x.n, 0);
+    const errs = j.by_status.filter(x => x.status >= 400).reduce((s, x) => s + x.n, 0);
+    const topUsers = (j.by_user || []).slice(0, 5).map(u =>
+      `<span class="acct-pillbox">${escapeHtml(u.username || "anon")} · ${u.n}</span>`).join(" ");
+    el.innerHTML = `
+      <div class="acct-summary-row">
+        <div><strong>${totalReq}</strong> requests</div>
+        <div>${errs} errors</div>
+        <div class="top-users">${topUsers}</div>
+      </div>`;
   }
 
   async function loadAdminUsers() {

@@ -1673,3 +1673,15 @@ body.is-mobile input, body.is-mobile textarea, body.is-mobile select {
 button.danger { color: #f47c7c; }
 button.ghost.danger:hover { background: rgba(244, 124, 124, 0.12); }
 .danger { color: #f47c7c; }
+
+/* Audit pane (A6+A10) */
+.acct-audit-summary { margin: 6px 0 8px; font-size: 12px; color: var(--fg-dim); }
+.acct-summary-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.acct-summary-row .top-users { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.acct-pillbox {
+  display: inline-block; padding: 1px 8px;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: 999px; font-size: 11px;
+}
+.acct-table tr.audit-warn td { color: #e7b54a; }
+.acct-table tr.audit-err  td { color: #f47c7c; background: rgba(244,124,124,0.05); }

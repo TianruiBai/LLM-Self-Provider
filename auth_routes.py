@@ -402,4 +402,132 @@ async def admin_kill_session(sid_prefix: str, _admin: Actor = Depends(require_ad
     return {"deleted": cur.rowcount}
 
 
+# ----------------------------------------------------- admin: audit log
+
+@router.get("/admin/audit")
+async def admin_audit(
+    _admin: Actor = Depends(require_admin),
+    limit: int = 200,
+    offset: int = 0,
+    user_id: Optional[int] = None,
+    api_key_id: Optional[int] = None,
+    method: Optional[str] = None,
+    path_prefix: Optional[str] = None,
+    status_min: Optional[int] = None,
+    status_max: Optional[int] = None,
+    since: Optional[int] = None,
+    ip: Optional[str] = None,
+) -> dict[str, Any]:
+    """Paginated read of ``request_audit`` with optional filters.
+
+    All filters are AND'd. ``limit`` is capped at 1000.
+    """
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+
+    where: list[str] = []
+    args: list[Any] = []
+    if user_id is not None:
+        where.append("a.user_id = ?"); args.append(user_id)
+    if api_key_id is not None:
+        where.append("a.api_key_id = ?"); args.append(api_key_id)
+    if method:
+        where.append("a.method = ?"); args.append(method.upper())
+    if path_prefix:
+        where.append("a.path LIKE ?"); args.append(path_prefix + "%")
+    if status_min is not None:
+        where.append("a.status >= ?"); args.append(int(status_min))
+    if status_max is not None:
+        where.append("a.status <= ?"); args.append(int(status_max))
+    if since is not None:
+        where.append("a.ts >= ?"); args.append(int(since))
+    if ip:
+        where.append("a.ip = ?"); args.append(ip)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    total_row = await asyncio.to_thread(
+        db.fetchone,
+        f"SELECT COUNT(*) AS n FROM request_audit a {where_sql}",
+        tuple(args),
+    )
+    rows = await asyncio.to_thread(
+        db.fetchall,
+        f"""
+        SELECT a.id, a.ts, a.user_id, a.api_key_id, a.ip, a.method, a.path,
+               a.status, a.bytes_in, a.bytes_out, a.duration_ms,
+               u.username AS username,
+               k.name     AS key_name,
+               k.key_prefix AS key_prefix
+        FROM request_audit a
+        LEFT JOIN users    u ON u.id = a.user_id
+        LEFT JOIN api_keys k ON k.id = a.api_key_id
+        {where_sql}
+        ORDER BY a.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(args) + (limit, offset),
+    )
+    return {
+        "total": int(total_row["n"]) if total_row else 0,
+        "limit": limit,
+        "offset": offset,
+        "rows": [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "user_id": r["user_id"],
+                "username": r["username"],
+                "api_key_id": r["api_key_id"],
+                "key_name": r["key_name"],
+                "key_prefix": r["key_prefix"],
+                "ip": r["ip"],
+                "method": r["method"],
+                "path": r["path"],
+                "status": r["status"],
+                "bytes_in": r["bytes_in"],
+                "bytes_out": r["bytes_out"],
+                "duration_ms": r["duration_ms"],
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/admin/audit/summary")
+async def admin_audit_summary(
+    _admin: Actor = Depends(require_admin),
+    since: Optional[int] = None,
+) -> dict[str, Any]:
+    """Lightweight aggregates for the admin dashboard."""
+    where_sql = ""
+    args: tuple[Any, ...] = ()
+    if since is not None:
+        where_sql = "WHERE ts >= ?"
+        args = (int(since),)
+
+    by_user = await asyncio.to_thread(
+        db.fetchall,
+        f"""
+        SELECT a.user_id, u.username, COUNT(*) AS n,
+               SUM(a.bytes_in)  AS bytes_in,
+               SUM(a.bytes_out) AS bytes_out,
+               AVG(a.duration_ms) AS avg_ms
+        FROM request_audit a LEFT JOIN users u ON u.id = a.user_id
+        {where_sql}
+        GROUP BY a.user_id ORDER BY n DESC LIMIT 50
+        """,
+        args,
+    )
+    by_status = await asyncio.to_thread(
+        db.fetchall,
+        f"SELECT status, COUNT(*) AS n FROM request_audit {where_sql} GROUP BY status ORDER BY status",
+        args,
+    )
+    return {
+        "by_user":   [dict(r) for r in by_user],
+        "by_status": [dict(r) for r in by_status],
+    }
+
+
 __all__ = ["router"]
