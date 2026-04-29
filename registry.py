@@ -39,11 +39,17 @@ class ModelConfig:
     #     mmproj_file: "mmproj-F16.gguf"   # optional vision projector
     #     revision: "main"                  # optional
     download: dict | None = None
+    # Phase C — backend selector. ``llama_cpp`` (default) spawns a local
+    # llama-server child; ``vllm`` treats ``endpoint`` as an OpenAI-
+    # compatible upstream (typically a Docker compose service).
+    backend: Literal["llama_cpp", "vllm"] = "llama_cpp"
+    # Required when ``backend == "vllm"``. Example: "http://vllm-chat:8000".
+    endpoint: str | None = None
 
 
 @dataclass
 class ServerConfig:
-    llama_server_bin: str
+    llama_server_bin: str = ""
     host: str = "127.0.0.1"
     chat_port: int = 18001
     embedding_port: int = 18002
@@ -69,6 +75,7 @@ class GatewayConfig:
 
 @dataclass
 class RagConfig:
+    backend: str = "mongo"  # "mongo" | "lance"
     mongo_uri: str = "mongodb://127.0.0.1:27017/?directConnection=true"
     database: str = "provider_rag"
     collection: str = "documents"
@@ -77,6 +84,7 @@ class RagConfig:
     default_top_k: int = 4
     chunk_chars: int = 1200
     chunk_overlap: int = 150
+    lance_dir: str = "data/lance"
 
 
 @dataclass

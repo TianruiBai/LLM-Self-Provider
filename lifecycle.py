@@ -98,6 +98,21 @@ class LifecycleManager:
         if cfg.kind != "chat":
             raise ValueError(f"Model {model_id!r} is not a chat model")
 
+        # Phase C — vLLM-backed models live as a separate Docker service.
+        # We never spawn a child for them; we just hand the endpoint back.
+        if getattr(cfg, "backend", "llama_cpp") == "vllm":
+            ep = cfg.endpoint
+            if not ep:
+                raise RuntimeError(f"vLLM model {model_id!r} has no endpoint configured")
+            # If a llama-server child is currently active, stop it so VRAM
+            # frees up before vLLM gets traffic.
+            async with self._chat_lock:
+                if self._chat is not None:
+                    log.info("Switching to vLLM chat backend; ejecting %s", self._chat.model.id)
+                    self._terminate(self._chat)
+                    self._chat = None
+            return ep.rstrip("/")
+
         async with self._chat_lock:
             if self._chat is not None and self._chat.alive() and self._chat.model.id == model_id:
                 return self._chat_base_url()
@@ -126,6 +141,10 @@ class LifecycleManager:
         cfg = self.cfg.sub_agent_model
         if cfg is None:
             raise RuntimeError("No sub_agent model configured")
+        if getattr(cfg, "backend", "llama_cpp") == "vllm":
+            if not cfg.endpoint:
+                raise RuntimeError("vLLM sub-agent has no endpoint configured")
+            return cfg.endpoint.rstrip("/")
         async with self._sub_agent_lock:
             if self._sub_agent is not None and self._sub_agent.alive():
                 return self._sub_agent_base_url()
@@ -137,6 +156,10 @@ class LifecycleManager:
         cfg = self.cfg.embedding_model
         if cfg is None:
             raise RuntimeError("No embedding model configured")
+        if getattr(cfg, "backend", "llama_cpp") == "vllm":
+            if not cfg.endpoint:
+                raise RuntimeError("vLLM embedder has no endpoint configured")
+            return cfg.endpoint.rstrip("/")
         async with self._embed_lock:
             self._embed_last_use = time.time()
             if self._embed is not None and self._embed.alive():
@@ -149,6 +172,10 @@ class LifecycleManager:
         cfg = self.cfg.vision_model
         if cfg is None:
             raise RuntimeError("No vision model configured")
+        if getattr(cfg, "backend", "llama_cpp") == "vllm":
+            if not cfg.endpoint:
+                raise RuntimeError("vLLM vision model has no endpoint configured")
+            return cfg.endpoint.rstrip("/")
         async with self._vision_lock:
             self._vision_last_use = time.time()
             if self._vision is not None and self._vision.alive():

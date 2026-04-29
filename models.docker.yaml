@@ -1,0 +1,39 @@
+# Models configuration baked into the Docker image. The gateway never
+# spawns subprocesses for these — vLLM serves them directly via the
+# OpenAI-compatible REST surface defined in compose.yml.
+#
+# Customize by mounting a different models.yaml at /app/provider/models.yaml.
+
+server:
+  llama_server_bin: ""   # unused: every model below sets backend=vllm
+
+gateway:
+  host: 0.0.0.0
+  port: 8088
+
+rag:
+  backend: lance
+  lance_dir: /app/data/lance
+  embedding_dim: 4096
+  default_top_k: 6
+  chunk_chars: 1200
+  chunk_overlap: 150
+
+models:
+  - id: chat
+    kind: chat
+    path: ""
+    backend: vllm
+    endpoint: http://vllm-chat:8000
+
+  - id: embedding
+    kind: embedding
+    path: ""
+    backend: vllm
+    endpoint: http://vllm-embed:8000
+
+  - id: vision
+    kind: vision
+    path: ""
+    backend: vllm
+    endpoint: http://vllm-vision:8000

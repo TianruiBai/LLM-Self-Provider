@@ -119,7 +119,14 @@ def _replay_as_sse(payload: dict[str, Any], model_id: str) -> AsyncIterator[byte
 def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     cfg = cfg or load_config()
     lifecycle = LifecycleManager(cfg)
-    rag = RagService(cfg, lifecycle.ensure_embedder)
+    backend = (getattr(cfg.rag, "backend", "mongo") or "mongo").lower()
+    if backend == "lance":
+        from .vector_store import LanceVectorStore
+        rag = LanceVectorStore(cfg, lifecycle.ensure_embedder)
+        log.info("RAG backend: lance (%s)", getattr(cfg.rag, "lance_dir", "data/lance"))
+    else:
+        rag = RagService(cfg, lifecycle.ensure_embedder)
+        log.info("RAG backend: mongo (%s)", cfg.rag.database)
     bus = EventBus()
 
     # Load persisted runtime config (e.g. user-supplied API keys) and mirror it
@@ -234,6 +241,11 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     # ``add_middleware`` ordering, ratelimit runs *after* auth resolution.
     from provider.ratelimit_mw import RateLimitMiddleware
     app.add_middleware(RateLimitMiddleware)
+
+    # Per-user concurrency cap (Phase C6). Installed alongside the rate
+    # limiter so the cap also runs after the actor has been resolved.
+    from provider.concurrency_mw import concurrency_middleware
+    app.middleware("http")(concurrency_middleware)
 
     # Authentication middleware: resolves the caller (Bearer API key or
     # session cookie) onto ``request.state.actor`` and rejects unauthenticated
@@ -653,6 +665,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         if want_builtin_tools or has_docs:
             body["tools"] = builtin_tools.merge_tools(
                 body.get("tools"), want_builtin_tools, has_documents=has_docs,
+                has_kb=(rag is not None),
             )
 
         # Apply per-model default system prompt when the request has none.
@@ -856,8 +869,12 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
                         "args_preview": (args_raw if isinstance(args_raw, str) else json.dumps(args))[:300],
                     })
                     if builtin_tools.is_builtin(name):
+                        _actor = getattr(req.state, "actor", None)
                         result = await builtin_tools.execute_tool(
                             name, args, http=proxy_client, docs=request_docs,
+                            rag=rag,
+                            viewer_id=(_actor.user.id if _actor and _actor.user else None),
+                            is_admin=(bool(_actor.is_admin) if _actor else False),
                         )
                     else:
                         # Unknown tool -> tell the model so it can recover.

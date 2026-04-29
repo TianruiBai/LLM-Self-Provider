@@ -149,8 +149,51 @@ SEARCH_DOCUMENTS_TOOL: dict[str, Any] = {
 DOC_TOOLS: list[dict[str, Any]] = [LIST_DOCUMENTS_TOOL, READ_DOCUMENT_TOOL, SEARCH_DOCUMENTS_TOOL]
 DOC_NAMES: set[str] = {t["function"]["name"] for t in DOC_TOOLS}
 
+# Knowledge-base search — registered when the gateway has a RAG backend
+# (Mongo or Lance) wired. Lets the model issue intermediate retrieval calls
+# while reasoning, in addition to the static rag-augmented prefix.
+KB_SEARCH_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "kb_search",
+        "description": (
+            "Search the user's private knowledge base and the global "
+            "knowledge base for context relevant to the query. Returns the "
+            "top matching chunks with id, source, score, and a text "
+            "preview. Use during reasoning to pull in additional facts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language query."},
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of chunks to return (default 5, max 20).",
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+                "scope": {
+                    "type": "string",
+                    "description": (
+                        "Which knowledge base to search: 'user' (private only), "
+                        "'global' (shared only), or 'both' (default)."
+                    ),
+                    "enum": ["user", "global", "both"],
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Optional source filter (e.g. 'docs').",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+KB_TOOLS: list[dict[str, Any]] = [KB_SEARCH_TOOL]
+KB_NAMES: set[str] = {t["function"]["name"] for t in KB_TOOLS}
+
 BUILTIN_TOOLS: list[dict[str, Any]] = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
-BUILTIN_NAMES: set[str] = {t["function"]["name"] for t in BUILTIN_TOOLS} | DOC_NAMES
+BUILTIN_NAMES: set[str] = {t["function"]["name"] for t in BUILTIN_TOOLS} | DOC_NAMES | KB_NAMES
 
 
 # --------------------------- document tool impl ---------------------------
@@ -488,6 +531,9 @@ async def execute_tool(
     *,
     http: httpx.AsyncClient | None = None,
     docs: list[dict[str, Any]] | None = None,
+    rag: Any | None = None,
+    viewer_id: int | None = None,
+    is_admin: bool = False,
 ) -> dict[str, Any]:
     """Execute a built-in tool by name. Always returns a JSON-serializable dict."""
     try:
@@ -520,10 +566,75 @@ async def execute_tool(
                 context_chars=int(args.get("context_chars", 160) or 160),
                 id=(str(args["id"]) if args.get("id") else None),
             )
+        if name == "kb_search":
+            return await kb_search(
+                rag,
+                query=str(args.get("query", "")),
+                top_k=int(args.get("top_k", 5) or 5),
+                scope=str(args.get("scope", "both") or "both"),
+                source=(str(args["source"]) if args.get("source") else None),
+                viewer_id=viewer_id,
+                is_admin=is_admin,
+            )
         return {"error": f"unknown built-in tool: {name}"}
     except Exception as e:  # noqa: BLE001
         log.exception("tool %s failed", name)
         return {"error": str(e)}
+
+
+async def kb_search(
+    rag: Any | None,
+    *,
+    query: str,
+    top_k: int = 5,
+    scope: str = "both",
+    source: str | None = None,
+    viewer_id: int | None = None,
+    is_admin: bool = False,
+) -> dict[str, Any]:
+    """Run a hybrid retrieval against the configured RAG backend."""
+    if rag is None:
+        return {"error": "knowledge base is not configured on this server"}
+    query = (query or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    top_k = max(1, min(int(top_k or 5), 20))
+    scope = (scope or "both").lower()
+    if scope == "both":
+        scopes: list[str] | None = None
+    elif scope in ("user", "global"):
+        scopes = [scope]
+    else:
+        return {"error": f"invalid scope {scope!r}"}
+    try:
+        hits = await rag.query(
+            query,
+            top_k=top_k,
+            source=source,
+            viewer_id=viewer_id,
+            is_admin=is_admin,
+            scopes=scopes,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"rag query failed: {e}"}
+    out_hits: list[dict[str, Any]] = []
+    for h in hits:
+        text = (getattr(h, "text", "") or "").strip()
+        if len(text) > 600:
+            text = text[:600].rstrip() + "…"
+        meta = getattr(h, "metadata", {}) or {}
+        out_hits.append(
+            {
+                "id": getattr(h, "id", ""),
+                "score": round(float(getattr(h, "score", 0.0)), 4),
+                "source": meta.get("source"),
+                "scope": meta.get("scope"),
+                "title": meta.get("title"),
+                "doc_id": meta.get("doc_id"),
+                "preview": text,
+            }
+        )
+    return {"hits": out_hits, "query": query, "top_k": top_k, "scope": scope}
 
 
 def merge_tools(
@@ -531,12 +642,16 @@ def merge_tools(
     want_builtin: bool,
     *,
     has_documents: bool = False,
+    has_kb: bool = False,
 ) -> list[dict[str, Any]]:
     """Merge user-provided tool list with the built-in catalog when requested.
 
     When ``has_documents`` is True, the document tools are appended even if
     the caller hasn't enabled the web tool catalog, because they only need
     the per-request docs context (no external network).
+
+    When ``has_kb`` is True, ``kb_search`` is appended (no external network
+    either — it queries the local vector store).
     """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -557,6 +672,12 @@ def merge_tools(
         for t in DOC_TOOLS:
             if t["function"]["name"] not in seen:
                 out.append(t)
+                seen.add(t["function"]["name"])
+    if has_kb:
+        for t in KB_TOOLS:
+            if t["function"]["name"] not in seen:
+                out.append(t)
+                seen.add(t["function"]["name"])
     return out
 
 
