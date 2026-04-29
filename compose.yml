@@ -133,7 +133,7 @@ services:
       LMSTUDIO_HOST_DIR: ${LMSTUDIO_DIR:-${HOME:-/root}/.lmstudio/models}
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-provider}_default
       HF_CACHE_VOLUME: ${COMPOSE_PROJECT_NAME:-provider}_hf-cache
-      VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+      VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
       VLLM_GPU_UTIL: ${VLLM_GPU_UTIL:-0.85}
       VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
       HF_TOKEN: ${HF_TOKEN:-}

@@ -550,37 +550,64 @@
       const sp = c.system_prompt || "";
       const ctx = c.ctx_size || "";
       const yamlArgs = (c.yaml_args || []).join(" ");
+      const id = m.id;
       return `
-      <details class="acct-model-row" data-id="${escapeHtml(m.id)}">
-        <summary>
-          <span class="mono" style="font-weight:600">${escapeHtml(m.id)}</span>
+      <details class="acct-model-row" data-id="${escapeHtml(id)}">
+        <summary class="acct-model-summary">
+          <span class="mono acct-model-id">${escapeHtml(id)}</span>
           <span class="acct-pillbox">${escapeHtml(m.kind)}</span>
           <span class="acct-pillbox">${escapeHtml(m.backend || "llama_cpp")}</span>
-          ${m.published ? `<span class="acct-pillbox" style="background:#16a34a33;color:#86efac">published</span>` : `<span class="acct-pillbox">draft</span>`}
-          ${m.label ? `<span class="hint">"${escapeHtml(m.label)}"</span>` : ""}
+          ${m.published
+            ? `<span class="acct-pillbox pub">published</span>`
+            : `<span class="acct-pillbox">draft</span>`}
+          ${m.label ? `<span class="acct-model-label">"${escapeHtml(m.label)}"</span>` : ""}
         </summary>
         <div class="acct-model-body">
-          <div class="hint mono" style="font-size:11px;word-break:break-all">${escapeHtml(m.path || "")}</div>
-          ${yamlArgs ? `<div class="hint">YAML args: <code>${escapeHtml(yamlArgs)}</code></div>` : ""}
-          <div class="acct-grid" style="grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
-            <label>Label (display name)
-              <input type="text" data-field="label" value="${escapeHtml(m.label || "")}" placeholder="e.g. Qwen3 35B (chat)">
-            </label>
-            <label>Context size (--max-model-len / -c)
-              <input type="number" data-field="ctx_size" value="${escapeHtml(String(ctx))}" placeholder="(default)">
-            </label>
+          ${m.path ? `<div class="acct-model-path mono">${escapeHtml(m.path)}</div>` : ""}
+          ${yamlArgs ? `<div class="hint">YAML defaults: <code>${escapeHtml(yamlArgs)}</code></div>` : ""}
+
+          <div class="acct-model-section">
+            <div class="acct-model-section-title">Display</div>
+            <div class="acct-model-grid">
+              <label>Label
+                <input type="text" data-field="label" value="${escapeHtml(m.label || "")}" placeholder="e.g. Qwen3.6 35B (chat)">
+                <span class="hint">Shown in the model picker.</span>
+              </label>
+              <label>Context size
+                <input type="number" data-field="ctx_size" value="${escapeHtml(String(ctx))}" placeholder="default" min="512" step="512">
+                <span class="hint">Maps to <code>--max-model-len</code> for vLLM, <code>-c</code> for llama.cpp.</span>
+              </label>
+            </div>
           </div>
-          <label style="margin-top:8px">Extra runtime args (one per token, e.g. <code>--tokenizer</code> on one line, value on next)
-            <textarea data-field="extra_args" rows="5" placeholder="--tokenizer&#10;Qwen/Qwen3-30B-A3B&#10;--tensor-parallel-size&#10;1">${escapeHtml(extra)}</textarea>
-          </label>
-          <label style="margin-top:8px">System prompt (prepended for this model)
+
+          <div class="acct-model-section">
+            <div class="acct-model-section-title">Runtime args</div>
+            ${m.backend === "vllm" ? `
+              <div class="acct-presets">
+                <span class="hint">Quick presets:</span>
+                <button type="button" class="ghost xs" data-preset="qwen3">+ Qwen3 reasoning</button>
+                <button type="button" class="ghost xs" data-preset="qwen3-tools">+ Qwen3 tool calling</button>
+                <button type="button" class="ghost xs" data-preset="prefix-cache">+ Prefix caching</button>
+                <button type="button" class="ghost xs" data-preset="trust-remote">+ Trust remote code</button>
+              </div>` : ""}
+            <textarea data-field="extra_args" rows="6" spellcheck="false"
+              placeholder="One token per line, e.g.&#10;--reasoning-parser&#10;qwen3&#10;--enable-prefix-caching">${escapeHtml(extra)}</textarea>
+            <span class="hint">Each line is one CLI token. Flag and value go on separate lines. Overrides the gateway defaults.</span>
+          </div>
+
+          <div class="acct-model-section">
+            <div class="acct-model-section-title">System prompt</div>
             <textarea data-field="system_prompt" rows="3" placeholder="(none)">${escapeHtml(sp)}</textarea>
-          </label>
-          <div class="acct-admin-actions" style="justify-content:flex-end;margin-top:8px">
-            <button class="ghost" data-act="toggle-publish">${m.published ? "Unpublish" : "Publish"}</button>
-            <button class="primary" data-act="save">Save</button>
+            <span class="hint">Prepended to every conversation routed to this model.</span>
           </div>
-          <div class="acct-msg" data-msg></div>
+
+          <div class="acct-model-actions">
+            <button class="ghost danger" data-act="reset" type="button">Reset</button>
+            <span class="acct-msg" data-msg></span>
+            <span style="flex:1"></span>
+            <button class="ghost" data-act="toggle-publish" type="button">${m.published ? "Unpublish" : "Publish"}</button>
+            <button class="primary" data-act="save" type="button">Save</button>
+          </div>
         </div>
       </details>`;
     }).join("") || `<p class="hint">No models discovered.</p>`;
@@ -590,7 +617,46 @@
       const get = sel => row.querySelector(sel);
       get('button[data-act="save"]').addEventListener("click", () => saveModelConfig(id, row));
       get('button[data-act="toggle-publish"]').addEventListener("click", () => togglePublish(id, row));
+      get('button[data-act="reset"]').addEventListener("click", () => resetModelConfig(id, row));
+      row.querySelectorAll("button[data-preset]").forEach(b =>
+        b.addEventListener("click", () => applyPreset(row, b.dataset.preset)));
     });
+  }
+
+  const _PRESETS = {
+    "qwen3":         ["--reasoning-parser", "qwen3"],
+    "qwen3-tools":   ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder"],
+    "prefix-cache":  ["--enable-prefix-caching"],
+    "trust-remote":  ["--trust-remote-code"],
+  };
+
+  function applyPreset(row, name) {
+    const ta = row.querySelector('textarea[data-field="extra_args"]');
+    if (!ta) return;
+    const cur = ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const add = _PRESETS[name] || [];
+    // Skip tokens already present (simple set check, sufficient for flags).
+    const merged = cur.slice();
+    for (const tok of add) {
+      if (!merged.includes(tok)) merged.push(tok);
+    }
+    ta.value = merged.join("\n");
+  }
+
+  async function resetModelConfig(id, row) {
+    if (!confirm("Clear all overrides for this model?")) return;
+    const r = await fetch(`/admin/models/${encodeURIComponent(id)}/config`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ctx_size: null, extra_args: [], system_prompt: null}),
+    });
+    const msgEl = row.querySelector("[data-msg]");
+    if (!r.ok) {
+      msgEl.textContent = `Reset failed: ${await r.text()}`;
+      msgEl.className = "acct-msg err";
+      return;
+    }
+    loadModels();
   }
 
   async function saveModelConfig(id, row) {

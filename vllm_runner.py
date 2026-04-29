@@ -91,7 +91,11 @@ class VllmRunner:
         self.network = os.environ.get("DOCKER_NETWORK", "provider_default")
         self.hf_volume = os.environ.get("HF_CACHE_VOLUME", "provider_hf-cache")
         self.lmstudio_host = os.environ.get("LMSTUDIO_HOST_DIR", "")
-        self.image = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:latest")
+        # Default to the Blackwell-compatible nightly image. The Qwen3 family
+        # (Qwen3.5/3.6) and sm_120 hardware need cu130; the stable ``latest``
+        # tag still ships cu128 wheels at the time of writing. Override with
+        # ``VLLM_IMAGE`` if you're on Hopper/Ada.
+        self.image = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:cu130-nightly")
         self.port = int(os.environ.get("VLLM_RUNNER_PORT", "8000"))
         self._states: dict[str, _SlotState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
