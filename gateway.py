@@ -122,6 +122,16 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     from provider import runtime_config
     runtime_config.load()
 
+    # Initialize control-plane SQLite DB (users, sessions, API keys, audit).
+    # This is a synchronous, fast, idempotent call (creates ~7 tables on first
+    # run, no-op afterwards) so we run it eagerly before the app starts.
+    from provider import db as _control_db
+    try:
+        _control_db.init()
+    except Exception as e:  # noqa: BLE001
+        log.exception("Control DB init failed: %s", e)
+        raise
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.info("Starting provider service")
