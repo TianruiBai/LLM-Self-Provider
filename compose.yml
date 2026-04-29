@@ -1,0 +1,137 @@
+# Production compose stack — Phase C/D.
+#
+# Bring up the full self-provider with one command:
+#     docker compose up -d
+#
+# Required env (put in `.env` next to this file):
+#   PROVIDER_AUTH_PEPPER          — 64 hex chars (used to HMAC-prefix passwords)
+#   PROVIDER_MASTER_KEY           — 64 hex chars (used to seal TOTP secrets)
+#   PROVIDER_BOOTSTRAP_ADMIN_USER — first admin username, created on first run
+#   PROVIDER_BOOTSTRAP_ADMIN_PASSWORD
+#   HF_TOKEN                       — optional, required for gated models
+#   VLLM_CHAT_MODEL                — e.g. Qwen/Qwen3-30B-A3B-Instruct-2507
+#   VLLM_EMBED_MODEL               — e.g. Qwen/Qwen3-Embedding-8B
+#   VLLM_VISION_MODEL              — e.g. google/gemma-3-4b-it
+#   VLLM_GPU_UTIL                  — 0..1, default 0.85
+#
+# A typical layout uses one Docker volume for HF cache, one for Lance, and one
+# for the SQLite control DB so backups can target a single tree.
+
+services:
+  vllm-chat:
+    image: vllm/vllm-openai:v0.6.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: 1
+    runtime: nvidia
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${VLLM_CHAT_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}
+      --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
+      --max-model-len 32768
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  vllm-embed:
+    image: vllm/vllm-openai:v0.6.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: 1
+    runtime: nvidia
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${VLLM_EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}
+      --task embed
+      --gpu-memory-utilization 0.5
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  vllm-vision:
+    image: vllm/vllm-openai:v0.6.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: 1
+    runtime: nvidia
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${VLLM_VISION_MODEL:-google/gemma-3-4b-it}
+      --gpu-memory-utilization 0.4
+      --max-model-len 8192
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8003:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      vllm-chat:
+        condition: service_healthy
+      vllm-embed:
+        condition: service_healthy
+    environment:
+      PROVIDER_AUTH_PEPPER: ${PROVIDER_AUTH_PEPPER:?must be set}
+      PROVIDER_MASTER_KEY: ${PROVIDER_MASTER_KEY:?must be set}
+      PROVIDER_BOOTSTRAP_ADMIN_USER: ${PROVIDER_BOOTSTRAP_ADMIN_USER:-admin}
+      PROVIDER_BOOTSTRAP_ADMIN_PASSWORD: ${PROVIDER_BOOTSTRAP_ADMIN_PASSWORD:?must be set}
+      PROVIDER_FORCE_SECURE_COOKIE: ${PROVIDER_FORCE_SECURE_COOKIE:-0}
+      PROVIDER_PUBLIC_BASE_URL: ${PROVIDER_PUBLIC_BASE_URL:-}
+      # OIDC (optional)
+      PROVIDER_OIDC_GITHUB_CLIENT_ID: ${PROVIDER_OIDC_GITHUB_CLIENT_ID:-}
+      PROVIDER_OIDC_GITHUB_CLIENT_SECRET: ${PROVIDER_OIDC_GITHUB_CLIENT_SECRET:-}
+      PROVIDER_OIDC_GOOGLE_CLIENT_ID: ${PROVIDER_OIDC_GOOGLE_CLIENT_ID:-}
+      PROVIDER_OIDC_GOOGLE_CLIENT_SECRET: ${PROVIDER_OIDC_GOOGLE_CLIENT_SECRET:-}
+    ports:
+      - "8088:8088"
+    volumes:
+      - control-db:/app/data
+      - lance:/app/data/lance
+      - ./models.docker.yaml:/app/provider/models.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hf-cache:
+  control-db:
+  lance:

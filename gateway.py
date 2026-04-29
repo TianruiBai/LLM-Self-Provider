@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -545,30 +545,106 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
 
     # ---------------- /v1/models ----------------
 
-    def _models_payload() -> dict[str, Any]:
-        now = int(time.time())
+    def _published_ids() -> dict[str, dict[str, Any]]:
+        """Return ``{model_id: {published, label}}`` from the control DB."""
+        from provider import db as _db
+        rows = _db.fetchall(
+            "SELECT model_id, published, label FROM model_publish"
+        )
         return {
-            "object": "list",
-            "data": [
-                {
-                    "id": m.id,
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "self-hosted",
-                    "kind": m.kind,
-                }
-                for m in cfg.models
-            ],
+            r["model_id"]: {"published": bool(r["published"]), "label": r["label"]}
+            for r in rows
         }
 
+    def _models_payload(viewer_is_admin: bool) -> dict[str, Any]:
+        now = int(time.time())
+        publish = _published_ids()
+        items: list[dict[str, Any]] = []
+        for m in cfg.models:
+            meta = publish.get(m.id, {"published": False, "label": None})
+            if not viewer_is_admin and not meta["published"]:
+                continue
+            items.append({
+                "id": m.id,
+                "object": "model",
+                "created": now,
+                "owned_by": "self-hosted",
+                "kind": m.kind,
+                "backend": getattr(m, "backend", "llama_cpp"),
+                "label": meta["label"],
+                "published": meta["published"],
+            })
+        return {"object": "list", "data": items}
+
+    def _viewer_is_admin(req: Request) -> bool:
+        actor = getattr(req.state, "actor", None)
+        return bool(actor and getattr(actor, "is_admin", False))
+
     @app.get("/v1/models")
-    async def list_models() -> dict[str, Any]:
-        return _models_payload()
+    async def list_models(req: Request) -> dict[str, Any]:
+        return _models_payload(_viewer_is_admin(req))
 
     # Some IDE clients omit the /v1 prefix.
     @app.get("/models")
-    async def list_models_alias() -> dict[str, Any]:
-        return _models_payload()
+    async def list_models_alias(req: Request) -> dict[str, Any]:
+        return _models_payload(_viewer_is_admin(req))
+
+    # Admin-only endpoints to curate which models are visible to end users.
+    from provider.auth_deps import require_admin as _require_admin
+    from provider.auth_deps import Actor as _Actor
+
+    @app.get("/admin/models")
+    async def admin_list_models(_: _Actor = Depends(_require_admin)) -> dict[str, Any]:
+        publish = _published_ids()
+        out: list[dict[str, Any]] = []
+        for m in cfg.models:
+            meta = publish.get(m.id, {"published": False, "label": None})
+            out.append({
+                "id": m.id,
+                "kind": m.kind,
+                "backend": getattr(m, "backend", "llama_cpp"),
+                "path": m.path,
+                "folder": m.folder,
+                "published": meta["published"],
+                "label": meta["label"],
+            })
+        return {"models": out}
+
+    @app.post("/admin/models/{model_id:path}/publish")
+    async def admin_publish_model(
+        model_id: str,
+        payload: dict[str, Any] | None = Body(default=None),
+        admin: _Actor = Depends(_require_admin),
+    ) -> dict[str, Any]:
+        try:
+            cfg.by_id(model_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
+        from provider import db as _db
+        label = (payload or {}).get("label")
+        _db.execute(
+            "INSERT INTO model_publish (model_id, published, label, updated_at, updated_by) "
+            "VALUES (?, 1, ?, ?, ?) "
+            "ON CONFLICT(model_id) DO UPDATE SET published=1, label=excluded.label, "
+            "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (model_id, label, _db.now_ts(), admin.user.id),
+        )
+        return {"model": model_id, "published": True, "label": label}
+
+    @app.post("/admin/models/{model_id:path}/unpublish")
+    async def admin_unpublish_model(
+        model_id: str,
+        admin: _Actor = Depends(_require_admin),
+    ) -> dict[str, Any]:
+        from provider import db as _db
+        _db.execute(
+            "INSERT INTO model_publish (model_id, published, updated_at, updated_by) "
+            "VALUES (?, 0, ?, ?) "
+            "ON CONFLICT(model_id) DO UPDATE SET published=0, "
+            "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (model_id, _db.now_ts(), admin.user.id),
+        )
+        return {"model": model_id, "published": False}
 
     # ---------------- /v1/embeddings ----------------
 
@@ -638,6 +714,15 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         if mcfg.kind not in ("chat", "sub_agent"):
             raise HTTPException(status_code=400, detail=f"Model {model_id!r} is not a chat-capable model")
+
+        # Non-admins may only invoke models the admin has explicitly published.
+        if not _viewer_is_admin(req):
+            meta = _published_ids().get(model_id)
+            if not meta or not meta["published"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Model {model_id!r} is not published for end users",
+                )
 
         # Built-in tool catalog: opt in via body["tools_builtin"] = true.
         # Strip the flag before forwarding so upstream doesn't see it.

@@ -65,6 +65,13 @@ class ServerConfig:
     # may contain a `model.yaml` (full ModelConfig) and a `*.gguf` weight,
     # an optional `mmproj*.gguf` (vision projector) and a `prompt.md`.
     models_dir: str | None = None
+    # Optional path to an LM Studio model cache (defaults to ``~/.lmstudio/
+    # models`` when present). Layout assumed:
+    #   <root>/<publisher>/<model_name>/*.gguf
+    # Each .gguf weight discovered there is registered as a ``chat`` model
+    # with id ``lmstudio/<publisher>/<model_name>``. Admins decide which of
+    # them are published to end users via the ``model_publish`` table.
+    lmstudio_dir: str | None = None
 
 
 @dataclass
@@ -153,11 +160,25 @@ def load_config(path: str | Path | None = None) -> ProviderConfig:
         else:
             print(f"[registry] models_dir does not exist: {base_dir}")
 
+    # Auto-discover GGUFs under the user's LM Studio cache. The default
+    # location is ``~/.lmstudio/models``; admins can point ``lmstudio_dir``
+    # elsewhere. Models are *registered* but stay invisible to non-admin
+    # users until an admin explicitly publishes them via /admin/models.
+    seen_ids = {m.id for m in models}
+    for discovered in _discover_lmstudio(server.lmstudio_dir):
+        if discovered.id in seen_ids:
+            continue
+        models.append(discovered)
+        seen_ids.add(discovered.id)
+
     seen: set[str] = set()
     for m in models:
         if m.id in seen:
             raise ValueError(f"Duplicate model id in registry: {m.id}")
         seen.add(m.id)
+        if m.backend == "vllm":
+            # vLLM models live in a remote container; no local file to check.
+            continue
         if not Path(m.path).exists():
             # Don't fail hard — warn at startup, fail at load time.
             print(f"[registry] WARNING: model file not found: {m.path}")
@@ -166,7 +187,7 @@ def load_config(path: str | Path | None = None) -> ProviderConfig:
         if m.kind not in ("chat", "embedding", "sub_agent", "vision"):
             raise ValueError(f"Invalid kind for {m.id}: {m.kind}")
 
-    if not Path(server.llama_server_bin).exists():
+    if server.llama_server_bin and not Path(server.llama_server_bin).exists():
         print(f"[registry] WARNING: llama-server not found: {server.llama_server_bin}")
 
     return ProviderConfig(server=server, gateway=gateway, rag=rag, models=models)
@@ -222,6 +243,64 @@ def _load_model_folder(folder: Path) -> ModelConfig | None:
         print(f"[registry] {yaml_path} missing id/kind/path; skipping")
         return None
     # Drop unknown keys to keep ModelConfig forward-compatible.
-    allowed = {"id", "kind", "path", "args", "binary", "mmproj", "system_prompt", "folder", "download"}
+    allowed = {"id", "kind", "path", "args", "binary", "mmproj", "system_prompt",
+               "folder", "download", "backend", "endpoint"}
     data = {k: v for k, v in data.items() if k in allowed}
     return ModelConfig(**data)
+
+
+# ---------------------------------------------------------------- LM Studio
+
+def _default_lmstudio_dir() -> Path | None:
+    """Return ``~/.lmstudio/models`` if it exists on this machine."""
+    candidates = [
+        Path.home() / ".lmstudio" / "models",
+        Path.home() / ".cache" / "lm-studio" / "models",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+def _discover_lmstudio(explicit: str | None) -> list[ModelConfig]:
+    """Walk an LM Studio model cache and register each GGUF as a chat model.
+
+    Layout (LM Studio convention):
+        <root>/<publisher>/<model_name>/<weights>.gguf
+        <root>/<publisher>/<model_name>/mmproj-*.gguf   (optional)
+
+    The first non-``mmproj`` ``.gguf`` per folder becomes the model weight.
+    Resulting id: ``lmstudio/<publisher>/<model_name>``. Multimodal repos
+    that ship an ``mmproj-*.gguf`` are auto-tagged ``kind=vision``.
+    """
+    root = Path(explicit) if explicit else _default_lmstudio_dir()
+    if root is None or not root.is_dir():
+        return []
+
+    out: list[ModelConfig] = []
+    for publisher in sorted(p for p in root.iterdir() if p.is_dir()):
+        for model_dir in sorted(m for m in publisher.iterdir() if m.is_dir()):
+            weights = sorted(
+                p for p in model_dir.glob("*.gguf")
+                if not p.name.lower().startswith(("mmproj", "mm-proj"))
+            )
+            if not weights:
+                continue
+            mmproj = sorted(model_dir.glob("mmproj*.gguf")) + sorted(
+                model_dir.glob("mm-proj*.gguf")
+            )
+            kind: ModelKind = "vision" if mmproj else "chat"
+            mid = f"lmstudio/{publisher.name}/{model_dir.name}"
+            out.append(
+                ModelConfig(
+                    id=mid,
+                    kind=kind,
+                    path=str(weights[0]),
+                    mmproj=str(mmproj[0]) if mmproj else None,
+                    folder=str(model_dir),
+                )
+            )
+    if out:
+        print(f"[registry] discovered {len(out)} LM Studio model(s) under {root}")
+    return out

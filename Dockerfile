@@ -15,12 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install python deps first to maximize layer cache.
-COPY provider/requirements.txt ./provider/requirements.txt
+COPY requirements.txt /app/provider/requirements.txt
 RUN pip install --upgrade pip && \
-    pip install -r provider/requirements.txt
+    pip install -r /app/provider/requirements.txt
 
-# Copy the package itself.
-COPY provider ./provider
+# Copy the package itself (build context is the provider/ folder).
+COPY . /app/provider
 
 # Where the SQLite control DB and Lance datasets live. Mounted as volumes
 # from compose.yml so the data outlives container rebuilds.
