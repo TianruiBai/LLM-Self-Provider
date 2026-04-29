@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#1a1d21" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Self-hosted Model Provider</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,300..700,0..1,-50..200&display=block" />
+<link rel="stylesheet" href="/ui/style.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" id="hljs-theme" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/common.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+</head>
+<body>
+<div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">⬢</div>
+      <div>
+        <div class="brand-title">Provider</div>
+        <div class="brand-sub">llama.cpp · CUDA</div>
+      </div>
+    </div>
+
+    <button id="new-chat" class="primary">+ New chat</button>
+
+    <div class="section-title">Conversations</div>
+    <ul id="conversations" class="conversations"></ul>
+
+    <div class="status">
+      <div class="status-dot" id="status-dot"></div>
+      <div id="status-text">connecting…</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button id="sidebar-toggle" class="ghost icon-btn sidebar-toggle" type="button" title="Menu" aria-label="Toggle sidebar"><span class="mi">menu</span></button>
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="chat" role="tab"><span class="mi">chat_bubble</span> Chat</button>
+        <button class="tab" data-tab="models" role="tab"><span class="mi">memory</span> Models</button>
+        <button class="tab" data-tab="knowledge" role="tab"><span class="mi">menu_book</span> Knowledge</button>
+        <button class="tab" data-tab="activity" role="tab">
+          <span class="mi">monitor_heart</span> Activity
+          <span class="act-dot" id="act-dot"></span>
+          <span id="act-count" class="act-count">0</span>
+        </button>
+      </nav>
+      <div class="topbar-actions">
+        <button id="theme-toggle" class="ghost icon-btn" type="button" title="Toggle light/dark theme"><span class="mi">dark_mode</span></button>
+      </div>
+    </header>
+
+    <!-- ============== CHAT TAB ============== -->
+    <section class="tab-view active" data-view="chat">
+      <div class="chat-bar">
+        <div class="chat-bar-left">
+          <label for="model-select">Model</label>
+          <select id="model-select"></select>
+          <button id="eject-model" class="ghost" type="button" title="Unload the active chat model from VRAM"><span class="mi">eject</span> Eject</button>
+          <button id="fetch-model" class="ghost" type="button" hidden title="Download this model's weights from Hugging Face"><span class="mi">download</span> Download</button>
+          <span id="fetch-progress" class="fetch-progress" hidden>
+            <span class="fetch-bar"><span id="fetch-bar-fill" class="fetch-bar-fill"></span></span>
+            <span id="fetch-progress-text" class="fetch-text">0%</span>
+          </span>
+        </div>
+        <div class="chat-bar-right">
+          <label class="switch">
+            <input type="checkbox" id="rag-toggle" />
+            <span>RAG</span>
+          </label>
+          <input type="text" id="rag-source" placeholder="rag source filter" />
+          <input type="number" id="rag-topk" min="1" max="20" value="4" title="top_k" />
+          <label class="switch">
+            <input type="checkbox" id="stream-toggle" checked />
+            <span>Stream</span>
+          </label>
+          <label class="switch">
+            <input type="checkbox" id="tools-toggle" />
+            <span title="Server-executed web_search + web_fetch tools">Web tools</span>
+          </label>
+          <button id="open-settings" class="ghost icon-btn" type="button" title="Settings"><span class="mi">settings</span></button>
+        </div>
+      </div>
+
+      <section id="messages" class="messages">
+        <div class="empty-hint">
+          <div class="empty-title">Start chatting</div>
+          <div>Pick a model above. The first message will load it on the GPU.</div>
+        </div>
+      </section>
+
+      <form id="composer" class="composer">
+        <div id="attachments" class="attachments"></div>
+        <div id="composer-dropzone" class="composer-dropzone">
+          <textarea id="prompt" rows="3" placeholder="Type a message — Shift+Enter for newline, Enter to send. Drag &amp; drop files here."></textarea>
+          <div class="drop-overlay" id="drop-overlay"><span class="mi">cloud_upload</span><span>Drop files to attach</span></div>
+        </div>
+        <div class="composer-row">
+          <div class="composer-meta" id="composer-meta"></div>
+          <input type="file" id="attach-image" accept="image/*" multiple hidden />
+          <button id="attach-btn" class="ghost icon-btn" type="button" title="Attach image (multimodal)"><span class="mi">image</span></button>
+          <input type="file" id="attach-doc" accept=".pdf,.docx,.pptx,.xlsx,.xlsm,.csv,.tsv,.md,.markdown,.txt,.rst,.log,.json,.jsonl,.ndjson,.yml,.yaml,.toml,.ini,.cfg,.html,.htm,.xml,.py,.js,.ts,.tsx,.jsx,.css,.scss,.c,.h,.cc,.cpp,.hpp,.rs,.go,.java,.kt,.rb,.php,.sh,.bash,.zsh,.ps1,.bat,.sql,.rtf,.epub,.odt,.odp,.ods" multiple hidden />
+          <button id="attach-doc-btn" class="ghost icon-btn" type="button" title="Attach documents (pdf, docx, pptx, xlsx, csv, txt, md…)"><span class="mi">attach_file</span></button>
+          <button id="mic-btn" class="ghost icon-btn" type="button" title="Voice input (Whisper)"><span class="mi">mic</span></button>
+          <button id="send" type="submit" class="primary"><span class="mi">send</span> Send</button>
+          <button id="stop" type="button" class="ghost" hidden><span class="mi">stop</span> Stop</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============== MODELS TAB ============== -->
+    <section class="tab-view" data-view="models">
+      <div class="panel-header">
+        <div>
+          <h1>Models</h1>
+          <p class="hint">Inspect, load, eject and download every registered model. Definitions live in
+            <code>provider/models_local/&lt;folder&gt;/model.yaml</code>.</p>
+        </div>
+        <button id="models-refresh" class="ghost" type="button"><span class="mi">refresh</span> Refresh</button>
+      </div>
+      <div class="active-strip" id="active-strip"></div>
+      <div id="models-grid" class="models-grid"></div>
+    </section>
+
+    <!-- ============== KNOWLEDGE TAB ============== -->
+    <section class="tab-view" data-view="knowledge">
+      <div class="panel-header">
+        <div>
+          <h1>Knowledge base</h1>
+          <p class="hint">Documents ingested into MongoDB Atlas Local with vector embeddings. Cards group chunks by
+            <code>doc_id</code>; the network shows linkage by shared <strong>source</strong> and <strong>tags</strong>.</p>
+        </div>
+        <div class="kb-stats" id="kb-stats">loading…</div>
+      </div>
+
+      <div class="kb-views">
+        <button class="kb-view-btn active" data-kbview="cards"><span class="mi">grid_view</span> Cards</button>
+        <button class="kb-view-btn" data-kbview="network"><span class="mi">hub</span> Network</button>
+        <button class="kb-view-btn" data-kbview="ingest"><span class="mi">add_circle</span> Ingest</button>
+        <button class="kb-view-btn" data-kbview="query"><span class="mi">search</span> Query</button>
+        <div class="kb-spacer"></div>
+        <input type="text" id="kb-filter-source" placeholder="filter source" />
+        <input type="text" id="kb-filter-tag" placeholder="filter tag" />
+        <button id="kb-refresh" type="button" class="ghost icon-btn" title="Refresh"><span class="mi">refresh</span></button>
+      </div>
+
+      <div class="kb-pane active" data-kbpane="cards">
+        <div id="kb-source-pills" class="kb-source-pills"></div>
+        <div id="kb-cards" class="kb-cards"></div>
+      </div>
+
+      <div class="kb-pane" data-kbpane="network">
+        <div class="kb-network-toolbar">
+          <label>link by
+            <select id="kb-net-mode">
+              <option value="tag">shared tag</option>
+              <option value="source">shared source</option>
+              <option value="both" selected>tag + source</option>
+            </select>
+          </label>
+          <div class="kb-net-modes" role="tablist" aria-label="View mode">
+            <button type="button" class="kb-net-mode-btn active" data-kbnetview="2d" title="2D map">2D</button>
+            <button type="button" class="kb-net-mode-btn" data-kbnetview="3d" title="3D map (drag to rotate)">3D</button>
+          </div>
+          <button type="button" id="kb-net-fit" class="ghost icon-btn" title="Fit / reset view"><span class="mi">center_focus_strong</span></button>
+          <button type="button" id="kb-net-zoom-in" class="ghost icon-btn" title="Zoom in"><span class="mi">add</span></button>
+          <button type="button" id="kb-net-zoom-out" class="ghost icon-btn" title="Zoom out"><span class="mi">remove</span></button>
+          <span class="hint" id="kb-net-stats"></span>
+        </div>
+        <div id="kb-network" class="kb-network">
+          <svg id="kb-network-svg"></svg>
+          <div id="kb-network-3d" class="kb-network-3d" hidden></div>
+          <div id="kb-node-card" class="kb-node-card" hidden></div>
+          <div class="kb-net-help" id="kb-net-help">drag to pan · scroll / pinch to zoom · click a node for details · dbl-click in 3D to focus</div>
+        </div>
+      </div>
+
+      <div class="kb-pane" data-kbpane="ingest">
+        <div class="kb-form-grid">
+          <label>Source <input type="text" id="ing-source" value="docs" /></label>
+          <label>Tags (comma) <input type="text" id="ing-tags" placeholder="onboarding, faq" /></label>
+          <label>Document title <input type="text" id="ing-title" placeholder="optional" /></label>
+        </div>
+        <textarea id="ing-text" rows="8" placeholder="Paste text or attach .txt/.md/.json/.csv files below"></textarea>
+        <input type="file" id="ing-file" accept=".txt,.md,.markdown,.json,.csv,.log" multiple />
+        <div class="dialog-row">
+          <button id="ing-submit" class="primary" type="button">Ingest</button>
+          <button id="ing-summarize" class="ghost" type="button" title="Summarize via the sub-agent then ingest">Summarize → ingest</button>
+          <span id="ing-status" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="kb-pane" data-kbpane="query">
+        <div class="kb-form-grid">
+          <label>Query <input type="text" id="rq-text" placeholder="what is X?" /></label>
+          <label>top_k <input type="number" id="rq-topk" min="1" max="20" value="5" /></label>
+          <label>Source filter <input type="text" id="rq-source" placeholder="optional" /></label>
+        </div>
+        <div class="dialog-row">
+          <button id="rq-submit" class="primary" type="button">Search</button>
+        </div>
+        <div id="rq-results" class="rq-results"></div>
+      </div>
+    </section>
+
+    <!-- ============== ACTIVITY TAB ============== -->
+    <section class="tab-view" data-view="activity">
+      <div class="panel-header">
+        <div>
+          <h1>Live API activity</h1>
+          <p class="hint">Every request hitting <code id="activity-base">/v1/*</code> on this gateway is streamed here in real time
+            (any external client — VS Code, LM-Studio, curl, another LAN host — will appear). <span id="activity-endpoint" class="hint"></span></p>
+        </div>
+        <div class="act-stats">
+          <div class="act-stat"><div class="act-stat-num" id="act-stat-live">0</div><div class="act-stat-lbl">live</div></div>
+          <div class="act-stat"><div class="act-stat-num" id="act-stat-total">0</div><div class="act-stat-lbl">total</div></div>
+          <div class="act-stat"><div class="act-stat-num" id="act-stat-err">0</div><div class="act-stat-lbl">errors</div></div>
+          <div class="act-stat"><div class="act-stat-num" id="act-stat-tps">—</div><div class="act-stat-lbl">avg tok/s</div></div>
+        </div>
+      </div>
+
+      <div class="act-toolbar">
+        <input type="text" id="act-filter-text" placeholder="filter by client / model / preview" />
+        <select id="act-filter-status">
+          <option value="">all status</option>
+          <option value="live">live</option>
+          <option value="ok">ok</option>
+          <option value="err">errors</option>
+        </select>
+        <select id="act-filter-model">
+          <option value="">all models</option>
+        </select>
+        <div class="kb-spacer"></div>
+        <button id="activity-clear" class="ghost" type="button">Clear</button>
+      </div>
+
+      <div class="activity-empty" id="activity-empty">
+        Waiting for API traffic…
+      </div>
+      <ul id="activity-list" class="activity-list"></ul>
+    </section>
+  </main>
+
+  <!-- Knowledge card detail drawer -->
+  <aside id="kb-drawer" class="kb-drawer" hidden>
+    <div class="kb-drawer-head">
+      <div>
+        <div class="kb-drawer-title" id="kb-drawer-title"></div>
+        <div class="kb-drawer-sub" id="kb-drawer-sub"></div>
+      </div>
+      <button id="kb-drawer-close" class="ghost icon-btn" type="button" title="Close"><span class="mi">close</span></button>
+    </div>
+    <div class="kb-drawer-meta" id="kb-drawer-meta"></div>
+    <div class="kb-drawer-body" id="kb-drawer-body"></div>
+  </aside>
+</div>
+
+<dialog id="settings-dialog">
+  <form method="dialog" class="dialog-form">
+    <h2>Settings</h2>
+    <h3 class="set-section">Sampling parameters <span class="hint-inline">— per-conversation</span></h3>
+    <p class="hint">Leave blank to let the model decide.</p>
+    <label>Temperature <input type="number" id="set-temperature" step="0.05" min="0" max="2" placeholder="0.7" /></label>
+    <label>Top-p <input type="number" id="set-top-p" step="0.01" min="0" max="1" placeholder="0.95" /></label>
+    <label>Top-k <input type="number" id="set-top-k" step="1" min="0" placeholder="40" /></label>
+    <label>Max tokens <input type="number" id="set-max-tokens" step="32" min="1" placeholder="2048" /></label>
+    <label>Repeat penalty <input type="number" id="set-repeat-penalty" step="0.05" min="0" max="2" placeholder="1.1" /></label>
+    <label>System prompt
+      <textarea id="set-system" rows="3" placeholder="Optional system message prepended to every request"></textarea>
+    </label>
+
+    <h3 class="set-section">External services</h3>
+    <p class="hint">Stored on the server in <code>provider/data/runtime_config.json</code> and exposed to <code>web_search</code> as the <code>TAVILY_API_KEY</code> env var. Leave blank to use the DuckDuckGo HTML fallback.</p>
+    <label>Tavily API key <input type="password" id="set-tavily-key" placeholder="tvly-..." autocomplete="off" /></label>
+    <div class="dialog-row"><span id="set-tavily-status" class="hint"></span></div>
+
+    <div class="dialog-row right">
+      <button id="settings-reset" type="button" class="ghost">Reset</button>
+      <button value="cancel" class="primary">Done</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

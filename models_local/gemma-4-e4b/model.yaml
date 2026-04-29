@@ -1,0 +1,27 @@
+id: "google/gemma-4-e4b"
+kind: vision
+# Google Gemma "4-E4B-it" — small omni-modal helper (text + image + audio).
+# Used by the gateway as a *pre-processor*: when a chat model that is NOT
+# multimodal (no `mmproj`) receives image / audio attachments, the gateway
+# routes the attachments through this model first to extract a text
+# description / transcript, then feeds that text into the real chat model.
+#
+# Pinned to CUDA0 (RTX 4070 Laptop, 8 GiB) so it does not steal VRAM from
+# the swappable chat model on CUDA1. Lazy-loaded on first vision request
+# and auto-unloaded after the configured idle timeout (see models.yaml).
+path: "C:/Users/Tass/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+mmproj: "C:/Users/Tass/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/mmproj-gemma-4-E4B-it-BF16.gguf"
+args:
+  - "--ctx-size"
+  - "65536"
+  - "--device"
+  - "CUDA0"
+  - "--n-gpu-layers"
+  - "999"
+  - "--batch-size"
+  - "256"
+  - "--ubatch-size"
+  - "256"
+  - "--parallel"
+  - "1"
+  - "--no-warmup"

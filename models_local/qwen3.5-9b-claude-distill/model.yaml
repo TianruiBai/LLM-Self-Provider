@@ -1,0 +1,22 @@
+id: "qwen/qwen3.5-9b-claude-distill"
+kind: sub_agent
+path: "C:/Users/Tass/.lmstudio/models/Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF/Qwen3.5-9B.Q4_K_M.gguf"
+# Lazy-loaded on first /v1/sub-agent/* call. Pinned to CUDA1
+# (RTX PRO 4000 Blackwell, 24 GiB) so summarize-to-RAG runs on the
+# workstation card; we unload it again after each summary to free VRAM.
+args:
+  - "--ctx-size"
+  - "32768"
+  - "--device"
+  - "CUDA1"
+  - "--fit"
+  - "on"
+  - "--fit-target"
+  - "512"
+  - "--batch-size"
+  - "256"
+  - "--ubatch-size"
+  - "256"
+  - "--parallel"
+  - "1"
+  - "--no-warmup"

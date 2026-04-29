@@ -1,0 +1,31 @@
+id: "qwen/qwen3.6-35b-a3b"
+kind: chat
+# 35B MoE (3B active), MXFP4_MOE quant. Smaller than Q4_K_M, still fits on
+# CUDA1 (24 GiB) with room for a generous KV cache at 128k ctx. The matching
+# vision projector (mmproj-F32.gguf) sits next to the weights and is picked
+# up explicitly below so multimodal requests skip the Gemma fallback path.
+path: "C:/Users/Tass/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+mmproj: "C:/Users/Tass/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-GGUF/mmproj-F32.gguf"
+args:
+  - "--ctx-size"
+  - "131072"
+  - "--device"
+  - "CUDA1"
+  - "--split-mode"
+  - "none"
+  - "--fit"
+  - "on"
+  - "--fit-target"
+  - "1024"
+  - "--batch-size"
+  - "512"
+  - "--ubatch-size"
+  - "512"
+  - "--parallel"
+  - "1"
+  - "--no-warmup"
+  # Use the GGUF's embedded chat template so tool/function-calling works.
+  - "--jinja"
+  # Surface <think>…</think> as reasoning_content (OpenAI/DeepSeek style).
+  - "--reasoning-format"
+  - "deepseek"

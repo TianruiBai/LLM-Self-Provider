@@ -1,0 +1,49 @@
+# Model registry for the self-hosted provider service.
+#
+# `kind: chat`     -> swappable LLM (only one active at a time on `chat_port`)
+# `kind: embedding`-> persistent embedder process on `embedding_port`
+#
+# `args` is appended verbatim to llama-server. Use it to tune ctx, device,
+# split-mode, fit-target, batch sizes, etc. per model.
+
+server:
+  # Upstream CUDA llama-server build. The Vulkan binary at
+  # C:/bv/bin/Release/llama-server.exe was the previous default but the
+  # CUDA backend handles MoE offload + KV pinning more reliably on this rig.
+  # CUDA0 = RTX 4070 Laptop (8 GiB) -> embedder + sub-agent.
+  # CUDA1 = RTX PRO 4000 Blackwell SFF (24 GiB) -> swappable chat models.
+  llama_server_bin: "C:/Users/Tass/Documents/DS-V4-llama/llama.cpp/build-cuda/bin/Release/llama-server.exe"
+  host: "127.0.0.1"
+  chat_port: 18001        # rotating port used by the active chat model
+  embedding_port: 18002   # persistent port for the embedder
+  sub_agent_port: 18003   # persistent port for the sub-agent
+  vision_port: 18004      # persistent port for the vision/audio helper
+  startup_timeout_s: 600  # how long to wait for /health to go ready
+  shutdown_timeout_s: 30
+  # Auto-evict the small-GPU helpers (embedder + vision) after this many
+  # seconds of inactivity to keep the RTX 4070 Laptop free between bursts.
+  # Set to 0 to disable.
+  idle_unload_after_s: 300
+  # Drop additional models into provider/models_local/<folder>/ with a
+  # `model.yaml` inside (and optionally weight.gguf, mmproj*.gguf, prompt.md).
+  # See provider/models_local/README.md for the layout.
+  models_dir: "models_local"
+
+gateway:
+  # 0.0.0.0 binds on every interface so phones / other PCs on the LAN
+  # can use this as their OpenAI-compatible endpoint (LM-Studio style).
+  # Use 127.0.0.1 if you want strict loopback only.
+  host: "0.0.0.0"
+  port: 8000
+
+rag:
+  mongo_uri: "mongodb://127.0.0.1:27017/?directConnection=true"
+  database: "provider_rag"
+  collection: "documents"
+  vector_index: "vector_index"
+  embedding_dim: 4096       # Qwen3-Embedding-8B output dimensionality
+  default_top_k: 4
+  chunk_chars: 1200
+  chunk_overlap: 150
+
+models: []

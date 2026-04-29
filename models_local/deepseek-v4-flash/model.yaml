@@ -1,0 +1,31 @@
+id: "deepseek-v4-flash"
+kind: chat
+# Validated quant from start_deepseek_v4_flash_server.py. The tecaprovn
+# Q3_K_M build crashes this fork at load with
+# `GGML_ASSERT(n_embd_head_qk_nope >= 1) failed`, so we use the antirez
+# IQ2XXS chat-v2 build that the launcher script uses successfully.
+path: "C:/Users/Tass/.lmstudio/models/antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
+# DeepSeek4 fork build with CONCAT-F32 patch + pipeline-parallel disabled.
+# Single CUDA1 (24 GiB) + CPU offload via --fit. Mirrors `stable-164k`.
+binary: "C:/Users/Tass/Documents/DS-V4-llama/llama.cpp-deepseek-v4-flash/build-cuda-ds4/bin/Release/llama-server.exe"
+args:
+  - "--ctx-size"
+  - "128000"
+  - "--device"
+  - "CUDA1"
+  - "--split-mode"
+  - "none"
+  - "--fit"
+  - "on"
+  - "--fit-target"
+  - "1024"
+  - "--batch-size"
+  - "64"
+  - "--ubatch-size"
+  - "64"
+  - "--parallel"
+  - "1"
+  - "--no-kv-unified"
+  - "--no-cont-batching"
+  - "--no-warmup"
+  - "--no-op-offload"

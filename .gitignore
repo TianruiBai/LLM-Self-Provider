@@ -1,0 +1,74 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.python-version
+
+# ----- Virtual envs -----
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# ----- Editor / OS -----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- Runtime data (contains secrets / per-user state) -----
+data/
+*.local.yaml
+*.local.json
+
+# ----- Logs / generated artifacts -----
+logs/
+*.log
+
+# ----- KB / vector store dumps -----
+kb/
+vectors/
+*.faiss
+*.index
+
+# ----- Model weights (never commit large GGUFs) -----
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+models_cache/
+hf_cache/
+
+# Inside provider/models_local we want the model.yaml configs,
+# but never any actual weight files that may live there.
+models_local/**/*.gguf
+models_local/**/*.bin
+models_local/**/*.safetensors
+models_local/**/*.pt
+models_local/**/*.pth
+models_local/**/*.onnx
+
+# ----- Misc -----
+*.tmp
+*.bak
+*.orig
+node_modules/

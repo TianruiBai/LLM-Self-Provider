@@ -1,0 +1,28 @@
+id: "minimax-m2.7"
+kind: chat
+path: "C:/Users/Tass/.lmstudio/models/unsloth/MiniMax-M2.7-GGUF/MiniMax-M2.7-UD-IQ2_XXS-00001-of-00003.gguf"
+# 230B MoE (256 experts, 8 active). Previous fit-based MoE overflow
+# crashed Vulkan with ErrorOutOfDeviceMemory on a 1 GiB buffer alloc;
+# `--cpu-moe` keeps every expert tensor in CPU RAM so only the dense
+# path (~3 GiB) + KV cache live on CUDA1.
+args:
+  - "--ctx-size"
+  - "131072"
+  - "--device"
+  - "CUDA1"
+  - "--split-mode"
+  - "none"
+  - "--n-gpu-layers"
+  - "999"
+  - "--cpu-moe"
+  - "--cache-type-k"
+  - "q8_0"
+  - "--cache-type-v"
+  - "q8_0"
+  - "--batch-size"
+  - "64"
+  - "--ubatch-size"
+  - "64"
+  - "--parallel"
+  - "1"
+  - "--no-warmup"
