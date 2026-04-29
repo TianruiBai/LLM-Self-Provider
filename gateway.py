@@ -646,6 +646,93 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         )
         return {"model": model_id, "published": False}
 
+    @app.get("/admin/models/{model_id:path}/config")
+    async def admin_get_model_config(
+        model_id: str,
+        _: _Actor = Depends(_require_admin),
+    ) -> dict[str, Any]:
+        try:
+            m = cfg.by_id(model_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
+        from provider import db as _db
+        row = _db.fetchone(
+            "SELECT ctx_size, extra_args, system_prompt FROM model_publish "
+            "WHERE model_id = ?",
+            (model_id,),
+        )
+        extra: list[str] = []
+        if row and row["extra_args"]:
+            try:
+                parsed = json.loads(row["extra_args"])
+                if isinstance(parsed, list):
+                    extra = [str(x) for x in parsed]
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "model": model_id,
+            "kind": m.kind,
+            "yaml_args": list(m.args),
+            "yaml_system_prompt": m.system_prompt,
+            "ctx_size": (row["ctx_size"] if row else None),
+            "extra_args": extra,
+            "system_prompt": (row["system_prompt"] if row else None),
+        }
+
+    @app.post("/admin/models/{model_id:path}/config")
+    async def admin_set_model_config(
+        model_id: str,
+        payload: dict[str, Any] = Body(...),
+        admin: _Actor = Depends(_require_admin),
+    ) -> dict[str, Any]:
+        try:
+            cfg.by_id(model_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
+        ctx_size = payload.get("ctx_size")
+        if ctx_size is not None:
+            try:
+                ctx_size = int(ctx_size)
+                if ctx_size <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="ctx_size must be a positive integer")
+        extra_args = payload.get("extra_args")
+        if extra_args is not None and not isinstance(extra_args, list):
+            raise HTTPException(status_code=400, detail="extra_args must be a list of strings")
+        if isinstance(extra_args, list):
+            extra_args = [str(x) for x in extra_args]
+        system_prompt = payload.get("system_prompt")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            raise HTTPException(status_code=400, detail="system_prompt must be a string")
+
+        from provider import db as _db
+        _db.execute(
+            "INSERT INTO model_publish (model_id, published, ctx_size, extra_args, "
+            "system_prompt, updated_at, updated_by) "
+            "VALUES (?, COALESCE((SELECT published FROM model_publish WHERE model_id=?),0), "
+            "?, ?, ?, ?, ?) "
+            "ON CONFLICT(model_id) DO UPDATE SET "
+            "ctx_size=excluded.ctx_size, extra_args=excluded.extra_args, "
+            "system_prompt=excluded.system_prompt, "
+            "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (model_id, model_id, ctx_size,
+             json.dumps(extra_args) if extra_args is not None else None,
+             system_prompt, _db.now_ts(), admin.user.id),
+        )
+        return {
+            "model": model_id,
+            "ctx_size": ctx_size,
+            "extra_args": extra_args,
+            "system_prompt": system_prompt,
+            "note": "takes effect on next model spawn / swap",
+        }
+
+    @app.get("/admin/gpus")
+    async def admin_gpus(_: _Actor = Depends(_require_admin)) -> dict[str, Any]:
+        from provider import gpu as _gpu
+        return _gpu.topology()
+
     # ---------------- /v1/embeddings ----------------
 
     @app.post("/v1/embeddings")

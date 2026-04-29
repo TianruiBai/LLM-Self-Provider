@@ -25,6 +25,40 @@ from .registry import ModelConfig, ProviderConfig
 log = logging.getLogger("provider.lifecycle")
 
 
+def _load_model_override(model_id: str) -> dict:
+    """Read ``model_publish`` overrides from the control DB.
+
+    Returns ``{}`` when the DB isn't initialised (e.g. early bootstrap or
+    standalone smoke tests). Never raises — overrides are best-effort.
+    """
+    try:
+        from . import db
+        row = db.fetchone(
+            "SELECT ctx_size, extra_args, system_prompt FROM model_publish "
+            "WHERE model_id = ?",
+            (model_id,),
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    if row is None:
+        return {}
+    out: dict = {}
+    if row["ctx_size"]:
+        out["ctx_size"] = int(row["ctx_size"])
+    extra = row["extra_args"]
+    if extra:
+        try:
+            import json
+            parsed = json.loads(extra)
+            if isinstance(parsed, list):
+                out["extra_args"] = [str(x) for x in parsed]
+        except Exception:  # noqa: BLE001
+            pass
+    if row["system_prompt"]:
+        out["system_prompt"] = row["system_prompt"]
+    return out
+
+
 class _Child:
     def __init__(self, model: ModelConfig, port: int, proc: subprocess.Popen, log_path: Path):
         self.model = model
@@ -319,13 +353,39 @@ class LifecycleManager:
         if not Path(model.path).exists():
             raise FileNotFoundError(f"model GGUF not found: {model.path}")
 
+        # Apply admin-editable overrides from the control DB (ctx_size,
+        # extra_args, system_prompt). Falls back to YAML defaults when the
+        # row is missing or columns are NULL.
+        override = _load_model_override(model.id)
+        args = list(model.args)
+        if override.get("ctx_size") and "--ctx-size" not in args and "-c" not in args:
+            args += ["--ctx-size", str(int(override["ctx_size"]))]
+        if override.get("extra_args"):
+            args += list(override["extra_args"])
+
+        # Auto-assign a GPU if the model didn't pin one. Honours explicit
+        # ``--device CUDA<n>`` in either YAML args or the admin override.
+        from . import gpu as _gpu
+        if not _gpu.args_have_device(args):
+            role = "chat" if model.kind in ("chat", "sub_agent") else (
+                "embed" if model.kind == "embedding" else "vision"
+            )
+            # sub_agent is a small chat model — bias toward the small GPU
+            # so the big chat model keeps its VRAM.
+            if model.kind == "sub_agent":
+                role = "sub_agent"
+            dev = _gpu.pick_device(role)  # type: ignore[arg-type]
+            if dev:
+                log.info("Auto-assigning %s (%s) to %s", model.id, model.kind, dev)
+                args += ["--device", dev]
+
         cmd = [
             bin_path,
             "--model", model.path,
             "--host", self.cfg.server.host,
             "--port", str(port),
             "--alias", model.id,
-            *model.args,
+            *args,
         ]
         if model.mmproj:
             if not Path(model.mmproj).exists():

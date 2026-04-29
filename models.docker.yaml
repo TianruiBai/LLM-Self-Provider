@@ -6,6 +6,10 @@
 
 server:
   llama_server_bin: ""   # unused: every model below sets backend=vllm
+  # Read-only host mount provided by compose.yml. Any GGUFs the operator
+  # has under ``$HOME/.lmstudio/models`` show up as ``lmstudio/<pub>/<model>``
+  # ids — but stay invisible to end users until an admin publishes them.
+  lmstudio_dir: /lmstudio
 
 gateway:
   host: 0.0.0.0

@@ -142,6 +142,29 @@ r = client.post(
 assert r.status_code != 403, r.text
 print("[4/4] /v1/chat/completions enforces publish status for users")
 
+# 5. GPU topology endpoint and per-model config overrides.
+r = client.get("/admin/gpus", headers=H_ADMIN)
+assert r.status_code == 200, r.text
+top = r.json()
+assert "gpus" in top and "assignment" in top
+print(f"[5/6] /admin/gpus topology: {len(top['gpus'])} GPU(s) discovered")
+
+r = client.post(
+    "/admin/models/public-model/config",
+    json={"ctx_size": 32768, "extra_args": ["--flash-attn"]},
+    headers=H_ADMIN,
+)
+assert r.status_code == 200, r.text
+r = client.get("/admin/models/public-model/config", headers=H_ADMIN).json()
+assert r["ctx_size"] == 32768, r
+assert r["extra_args"] == ["--flash-attn"], r
+
+# Lifecycle override loader sees the new row.
+from provider.lifecycle import _load_model_override
+ov = _load_model_override("public-model")
+assert ov.get("ctx_size") == 32768 and ov.get("extra_args") == ["--flash-attn"]
+print("[6/6] /admin/models/<id>/config persisted and read by lifecycle")
+
 # Cleanup.
 shutil.rmtree(WORK, ignore_errors=True)
 print("ALL GREEN")

@@ -125,6 +125,10 @@ services:
       - control-db:/app/data
       - lance:/app/data/lance
       - ./models.docker.yaml:/app/provider/models.yaml:ro
+      # Mount the host's LM Studio model cache *read-only* so the gateway
+      # can auto-discover GGUFs without ever mutating them. Set
+      # ``LMSTUDIO_DIR`` in .env to override the default ``$HOME/.lmstudio/models``.
+      - ${LMSTUDIO_DIR:-${HOME:-/root}/.lmstudio/models}:/lmstudio:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
       interval: 30s
