@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -132,6 +133,21 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         log.exception("Control DB init failed: %s", e)
         raise
 
+    # Optional: create the first admin from environment variables on startup.
+    # Skipped silently if any user already exists.
+    _bootstrap_user = os.environ.get("PROVIDER_BOOTSTRAP_ADMIN_USER")
+    _bootstrap_pw = os.environ.get("PROVIDER_BOOTSTRAP_ADMIN_PASSWORD")
+    if _bootstrap_user and _bootstrap_pw:
+        try:
+            from provider import auth as _auth_svc
+            existing = _control_db.fetchone("SELECT COUNT(*) AS n FROM users")
+            if existing and existing["n"] == 0:
+                _auth_svc.ensure_initial_admin(_bootstrap_user, _bootstrap_pw)
+                log.info("Bootstrapped admin user %r from env", _bootstrap_user)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Admin bootstrap failed: %s", e)
+
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.info("Starting provider service")
@@ -200,6 +216,20 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
                     log.info("%s %s -> %d (%.0f ms)", method, path, status_holder["code"], dt)
 
     app.add_middleware(_AccessLogMiddleware)
+
+    # Authentication middleware: resolves the caller (Bearer API key or
+    # session cookie) onto ``request.state.actor`` and rejects unauthenticated
+    # access to protected route prefixes (/v1/*, /admin/*, /rag/*, /events,
+    # /auth/me|logout|keys|totp|users|sessions). Public prefixes (/health,
+    # /ui/, /auth/login, /auth/bootstrap) and unprotected legacy routes are
+    # passed through untouched.
+    from provider.auth_deps import AuthMiddleware
+    app.add_middleware(AuthMiddleware)
+
+    # /auth router: login/logout/me, API-key CRUD, TOTP, recovery codes,
+    # bootstrap, admin user/session/key management.
+    from provider.auth_routes import router as _auth_router
+    app.include_router(_auth_router)
 
     proxy_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
 
