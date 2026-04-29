@@ -30,6 +30,56 @@ class RagHit:
     metadata: dict[str, Any]
 
 
+# ----------------------------------------------------- scope helpers
+
+# Allowed values for the per-chunk ``scope`` field.
+SCOPE_USER = "user"
+SCOPE_GLOBAL = "global"
+_VALID_SCOPES = (SCOPE_USER, SCOPE_GLOBAL)
+
+
+def _scope_match(
+    viewer_id: int | None,
+    *,
+    is_admin: bool,
+    scopes: list[str] | None,
+) -> dict[str, Any]:
+    """Build a Mongo ``$match`` clause restricting visibility per A9 rules.
+
+    * ``viewer_id=None`` (anonymous in dev mode): treated like a regular user
+      with no private docs → ``scope:'global'`` only.
+    * ``is_admin=True``: sees everything; only the explicit ``scopes`` filter
+      applies.
+    * Regular user: sees ``scope='global'`` plus their own ``scope='user'``
+      docs. Legacy docs (no ``scope`` field) are treated as global for
+      backwards compatibility.
+    """
+    requested = [s for s in (scopes or [SCOPE_USER, SCOPE_GLOBAL]) if s in _VALID_SCOPES]
+    if not requested:
+        requested = [SCOPE_USER, SCOPE_GLOBAL]
+
+    if is_admin:
+        if SCOPE_USER in requested and SCOPE_GLOBAL in requested:
+            return {}
+        if SCOPE_USER in requested:
+            return {"scope": SCOPE_USER}
+        return {"$or": [{"scope": SCOPE_GLOBAL}, {"scope": {"$exists": False}}]}
+
+    clauses: list[dict[str, Any]] = []
+    if SCOPE_GLOBAL in requested:
+        # Legacy chunks without a scope are visible-as-global.
+        clauses.append({"$or": [{"scope": SCOPE_GLOBAL}, {"scope": {"$exists": False}}]})
+    if SCOPE_USER in requested and viewer_id is not None:
+        clauses.append({"scope": SCOPE_USER, "owner_id": int(viewer_id)})
+
+    if not clauses:
+        # No accessible docs.
+        return {"_id": {"$exists": False}}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
 def _chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:
     text = text.strip()
     if not text:
@@ -155,21 +205,33 @@ class RagService:
         *,
         source: str = "api",
         tags: list[str] | None = None,
+        owner_id: int | None = None,
+        scope: str = SCOPE_GLOBAL,
     ) -> dict[str, Any]:
-        """`documents` is an iterable of {"text": str, "metadata": {...}}."""
+        """`documents` is an iterable of {"text": str, "metadata": {...}}.
+
+        ``owner_id`` and ``scope`` (``'user'`` | ``'global'``) are stamped on
+        every chunk for A9 KB scoping. The caller (gateway) is responsible
+        for enforcing role rules (only admins may set ``scope='global'``;
+        regular users get ``scope='user'`` + their own ``owner_id``).
+        """
+        if scope not in _VALID_SCOPES:
+            raise ValueError(f"scope must be one of {_VALID_SCOPES}")
         chunks: list[dict[str, Any]] = []
         for d in documents:
             text = d.get("text", "")
             meta = d.get("metadata") or {}
             for i, piece in enumerate(_chunk_text(text, self.cfg.rag.chunk_chars, self.cfg.rag.chunk_overlap)):
                 chunks.append({
-                    "_id": _doc_id(source + str(meta.get("id", "")), i, piece),
+                    "_id": _doc_id(source + str(meta.get("id", "")) + (f":{owner_id}" if scope == SCOPE_USER and owner_id else ""), i, piece),
                     "source": source,
                     "tags": list(tags or []),
                     "text": piece,
                     "metadata": meta,
                     "chunk_index": i,
                     "ingested_at": time.time(),
+                    "scope": scope,
+                    "owner_id": int(owner_id) if owner_id is not None else None,
                 })
 
         if not chunks:
@@ -203,6 +265,9 @@ class RagService:
         top_k: int | None = None,
         source: str | None = None,
         tags: list[str] | None = None,
+        viewer_id: int | None = None,
+        is_admin: bool = False,
+        scopes: list[str] | None = None,
     ) -> list[RagHit]:
         if not text.strip():
             return []
@@ -226,6 +291,8 @@ class RagService:
                     "metadata": 1,
                     "source": 1,
                     "tags": 1,
+                    "scope": 1,
+                    "owner_id": 1,
                     "score": {"$meta": "vectorSearchScore"},
                 }
             },
@@ -235,6 +302,9 @@ class RagService:
             match["source"] = source
         if tags:
             match["tags"] = {"$in": tags}
+        scope_clause = _scope_match(viewer_id, is_admin=is_admin, scopes=scopes)
+        if scope_clause:
+            match = {**match, **scope_clause} if not match else {"$and": [match, scope_clause]}
         if match:
             pipeline.insert(1, {"$match": match})
 
@@ -247,6 +317,8 @@ class RagService:
                 metadata={
                     "source": doc.get("source"),
                     "tags": doc.get("tags", []),
+                    "scope": doc.get("scope") or SCOPE_GLOBAL,
+                    "owner_id": doc.get("owner_id"),
                     **(doc.get("metadata") or {}),
                 },
             ))
@@ -267,10 +339,19 @@ class RagService:
 
     # ------------- knowledge management -------------
 
-    async def stats(self) -> dict[str, Any]:
-        total = await self._coll.count_documents({})
-        sources: list[dict[str, Any]] = []
-        async for d in await self._coll.aggregate([
+    async def stats(
+        self,
+        *,
+        viewer_id: int | None = None,
+        is_admin: bool = False,
+        scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        scope_match = _scope_match(viewer_id, is_admin=is_admin, scopes=scopes)
+        total = await self._coll.count_documents(scope_match or {})
+        pipeline: list[dict[str, Any]] = []
+        if scope_match:
+            pipeline.append({"$match": scope_match})
+        pipeline += [
             {"$group": {
                 "_id": "$source",
                 "chunks": {"$sum": 1},
@@ -279,7 +360,9 @@ class RagService:
                 "last": {"$max": "$ingested_at"},
             }},
             {"$sort": {"last": -1}},
-        ]):
+        ]
+        sources: list[dict[str, Any]] = []
+        async for d in await self._coll.aggregate(pipeline):
             tag_set: set[str] = set()
             for arr in d.get("tags") or []:
                 if isinstance(arr, list):
@@ -299,6 +382,9 @@ class RagService:
         source: str | None = None,
         tag: str | None = None,
         limit: int = 200,
+        viewer_id: int | None = None,
+        is_admin: bool = False,
+        scopes: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Group chunks back into "knowledge cards" keyed by metadata.id (or source)."""
         match: dict[str, Any] = {}
@@ -306,6 +392,9 @@ class RagService:
             match["source"] = source
         if tag:
             match["tags"] = tag
+        scope_clause = _scope_match(viewer_id, is_admin=is_admin, scopes=scopes)
+        if scope_clause:
+            match = {**match, **scope_clause} if not match else {"$and": [match, scope_clause]}
         pipeline: list[dict[str, Any]] = []
         if match:
             pipeline.append({"$match": match})
@@ -318,6 +407,8 @@ class RagService:
                 },
                 "title": {"$first": "$metadata.title"},
                 "tags": {"$first": "$tags"},
+                "scope": {"$first": "$scope"},
+                "owner_id": {"$first": "$owner_id"},
                 "chunks": {"$sum": 1},
                 "first_text": {"$first": "$text"},
                 "ingested_at": {"$max": "$ingested_at"},
@@ -336,6 +427,8 @@ class RagService:
                 "doc_id": d["_id"]["doc_id"],
                 "title": d.get("title") or d["_id"]["doc_id"],
                 "tags": d.get("tags") or [],
+                "scope": d.get("scope") or SCOPE_GLOBAL,
+                "owner_id": d.get("owner_id"),
                 "chunks": d.get("chunks", 0),
                 "preview": preview,
                 "ingested_at": d.get("ingested_at"),
@@ -350,6 +443,9 @@ class RagService:
         source: str | None = None,
         doc_id: str | None = None,
         tag: str | None = None,
+        viewer_id: int | None = None,
+        is_admin: bool = False,
+        scopes: list[str] | None = None,
     ) -> dict[str, Any]:
         q: dict[str, Any] = {}
         if chunk_ids:
@@ -362,115 +458,29 @@ class RagService:
             q["tags"] = tag
         if not q:
             raise ValueError("delete requires at least one of: chunk_ids, source, doc_id, tag")
+        scope_clause = _scope_match(viewer_id, is_admin=is_admin, scopes=scopes)
+        if scope_clause:
+            q = {"$and": [q, scope_clause]}
         res = await self._coll.delete_many(q)
         return {"deleted": int(res.deleted_count)}
 
-    # ------------- knowledge management -------------
-
-    async def stats(self) -> dict[str, Any]:
-        total = await self._coll.count_documents({})
-        sources: list[dict[str, Any]] = []
-        async for d in await self._coll.aggregate([
-            {"$group": {
-                "_id": "$source",
-                "chunks": {"$sum": 1},
-                "docs": {"$addToSet": "$metadata.id"},
-                "tags": {"$addToSet": "$tags"},
-                "last": {"$max": "$ingested_at"},
-            }},
-            {"$sort": {"last": -1}},
-        ]):
-            tag_set: set[str] = set()
-            for arr in d.get("tags") or []:
-                if isinstance(arr, list):
-                    tag_set.update(arr)
-            sources.append({
-                "source": d["_id"] or "(none)",
-                "chunks": d.get("chunks", 0),
-                "documents": [x for x in (d.get("docs") or []) if x],
-                "tags": sorted(tag_set),
-                "last_ingested_at": d.get("last"),
-            })
-        return {"total_chunks": total, "sources": sources}
-
-    async def list_documents(
+    async def get_chunks(
         self,
+        chunk_ids: list[str],
         *,
-        source: str | None = None,
-        tag: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        """Group chunks back into "knowledge cards" keyed by metadata.id (or source)."""
-        match: dict[str, Any] = {}
-        if source:
-            match["source"] = source
-        if tag:
-            match["tags"] = tag
-        pipeline: list[dict[str, Any]] = []
-        if match:
-            pipeline.append({"$match": match})
-        pipeline += [
-            {"$sort": {"chunk_index": 1}},
-            {"$group": {
-                "_id": {
-                    "source": "$source",
-                    "doc_id": {"$ifNull": ["$metadata.id", "$_id"]},
-                },
-                "title": {"$first": "$metadata.title"},
-                "tags": {"$first": "$tags"},
-                "chunks": {"$sum": 1},
-                "first_text": {"$first": "$text"},
-                "ingested_at": {"$max": "$ingested_at"},
-                "chunk_ids": {"$push": "$_id"},
-            }},
-            {"$sort": {"ingested_at": -1}},
-            {"$limit": int(limit)},
-        ]
-        cards: list[dict[str, Any]] = []
-        async for d in await self._coll.aggregate(pipeline):
-            preview = (d.get("first_text") or "").strip()
-            if len(preview) > 280:
-                preview = preview[:280].rstrip() + "…"
-            cards.append({
-                "source": d["_id"]["source"],
-                "doc_id": d["_id"]["doc_id"],
-                "title": d.get("title") or d["_id"]["doc_id"],
-                "tags": d.get("tags") or [],
-                "chunks": d.get("chunks", 0),
-                "preview": preview,
-                "ingested_at": d.get("ingested_at"),
-                "chunk_ids": d.get("chunk_ids", []),
-            })
-        return cards
-
-    async def delete(
-        self,
-        *,
-        chunk_ids: list[str] | None = None,
-        source: str | None = None,
-        doc_id: str | None = None,
-        tag: str | None = None,
-    ) -> dict[str, Any]:
-        q: dict[str, Any] = {}
-        if chunk_ids:
-            q["_id"] = {"$in": list(chunk_ids)}
-        if source:
-            q["source"] = source
-        if doc_id:
-            q["metadata.id"] = doc_id
-        if tag:
-            q["tags"] = tag
-        if not q:
-            raise ValueError("delete requires at least one of: chunk_ids, source, doc_id, tag")
-        res = await self._coll.delete_many(q)
-        return {"deleted": int(res.deleted_count)}
-
-    async def get_chunks(self, chunk_ids: list[str]) -> list[dict]:
+        viewer_id: int | None = None,
+        is_admin: bool = False,
+        scopes: list[str] | None = None,
+    ) -> list[dict]:
         """Fetch full chunk records by id, preserving the requested order."""
         if not chunk_ids:
             return []
         ids = list(chunk_ids)
-        cur = self._coll.find({"_id": {"$in": ids}})
+        q: dict[str, Any] = {"_id": {"$in": ids}}
+        scope_clause = _scope_match(viewer_id, is_admin=is_admin, scopes=scopes)
+        if scope_clause:
+            q = {"$and": [q, scope_clause]}
+        cur = self._coll.find(q)
         by_id: dict = {}
         async for d in cur:
             by_id[d["_id"]] = {
@@ -479,6 +489,8 @@ class RagService:
                 "chunk_index": d.get("chunk_index"),
                 "source": d.get("source"),
                 "tags": d.get("tags") or [],
+                "scope": d.get("scope") or SCOPE_GLOBAL,
+                "owner_id": d.get("owner_id"),
                 "metadata": d.get("metadata") or {},
                 "ingested_at": d.get("ingested_at"),
             }

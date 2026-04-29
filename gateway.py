@@ -12,15 +12,16 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .auth_deps import Actor, get_actor
 from .events import EventBus
 from .lifecycle import LifecycleManager
-from .rag import RagService
+from .rag import RagService, SCOPE_GLOBAL, SCOPE_USER
 from .registry import ProviderConfig, load_config
 from . import tools as builtin_tools
 from . import downloader as model_downloader
@@ -37,6 +38,7 @@ class RagOptions(BaseModel):
     source: str | None = None
     tags: list[str] | None = None
     query: str | None = None  # override; otherwise last user message is used
+    scope: list[str] | None = None  # subset of {'user','global'}; default both
 
 
 class IngestDoc(BaseModel):
@@ -48,6 +50,7 @@ class IngestRequest(BaseModel):
     documents: list[IngestDoc]
     source: str = "api"
     tags: list[str] = Field(default_factory=list)
+    scope: str | None = None  # 'user' (default) or 'global' (admin only)
 
 
 class QueryRequest(BaseModel):
@@ -55,6 +58,7 @@ class QueryRequest(BaseModel):
     top_k: int | None = None
     source: str | None = None
     tags: list[str] | None = None
+    scope: list[str] | None = None
 
 
 # ----------------- app factory -----------------
@@ -413,7 +417,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=f"extract failed: {e}")
 
     @app.post("/admin/summarize")
-    async def admin_summarize(payload: dict) -> dict[str, Any]:
+    async def admin_summarize(payload: dict, actor: Actor = Depends(get_actor)) -> dict[str, Any]:
         """Summarize text via the sub-agent and ingest the result into RAG.
 
         Body: {text, title?, source?, tags?, style?, max_tokens?, temperature?}
@@ -426,6 +430,13 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         title = (payload.get("title") or "summary").strip() or "summary"
         source = (payload.get("source") or "summaries").strip() or "summaries"
         tags = list(payload.get("tags") or ["summary"])
+        # Default summarize ingest into the user's private KB. An admin can
+        # request scope='global' explicitly via the body.
+        scope = (payload.get("scope") or SCOPE_USER).lower()
+        if scope not in (SCOPE_USER, SCOPE_GLOBAL):
+            raise HTTPException(status_code=400, detail="scope must be 'user' or 'global'")
+        if scope == SCOPE_GLOBAL and not actor.is_admin:
+            raise HTTPException(status_code=403, detail="only admins can ingest into the global KB")
         style = payload.get("style") or "concise"
         unload_after = bool(payload.get("unload_after", True))
         try:
@@ -482,6 +493,8 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
                 [{"text": summary, "metadata": {"id": doc_id, "title": title}}],
                 source=source,
                 tags=tags,
+                owner_id=actor.user.id if scope == SCOPE_USER else None,
+                scope=scope,
             )
         except Exception as e:  # noqa: BLE001
             if unload_after:
@@ -668,7 +681,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             if rag_opts:
                 opts = RagOptions(**rag_opts) if not isinstance(rag_opts, RagOptions) else rag_opts
                 if opts.enabled:
-                    rag_hits_summary = await _augment_with_rag(body, opts)
+                    rag_hits_summary = await _augment_with_rag(body, opts, getattr(req.state, "actor", None))
                     rag_used = bool(rag_hits_summary)
 
         # Vision pre-processing: when the active chat model has no `mmproj`
@@ -981,7 +994,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             headers=headers,
         )
 
-    async def _augment_with_rag(body: dict, opts: RagOptions) -> list[dict[str, Any]]:
+    async def _augment_with_rag(body: dict, opts: RagOptions, actor: Actor | None) -> list[dict[str, Any]]:
         messages = body.get("messages") or []
         query = opts.query
         if not query:
@@ -999,7 +1012,15 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         if not query:
             return []
         try:
-            hits = await rag.query(query, top_k=opts.top_k, source=opts.source, tags=opts.tags)
+            hits = await rag.query(
+                query,
+                top_k=opts.top_k,
+                source=opts.source,
+                tags=opts.tags,
+                viewer_id=actor.user.id if actor else None,
+                is_admin=actor.is_admin if actor else False,
+                scopes=opts.scope,
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("RAG query failed; skipping augmentation: %s", e)
             return []
@@ -1164,16 +1185,32 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     # ---------------- /rag/* ----------------
 
     @app.post("/rag/ingest")
-    async def rag_ingest(payload: IngestRequest) -> dict[str, Any]:
+    async def rag_ingest(payload: IngestRequest, actor: Actor = Depends(get_actor)) -> dict[str, Any]:
+        # Default scope = 'user' (private). 'global' requires admin role.
+        scope = (payload.scope or SCOPE_USER).lower()
+        if scope not in (SCOPE_USER, SCOPE_GLOBAL):
+            raise HTTPException(status_code=400, detail="scope must be 'user' or 'global'")
+        if scope == SCOPE_GLOBAL and not actor.is_admin:
+            raise HTTPException(status_code=403, detail="only admins can ingest into the global KB")
         return await rag.ingest(
             ({"text": d.text, "metadata": d.metadata} for d in payload.documents),
             source=payload.source,
             tags=payload.tags,
+            owner_id=actor.user.id if scope == SCOPE_USER else None,
+            scope=scope,
         )
 
     @app.post("/rag/query")
-    async def rag_query(payload: QueryRequest) -> dict[str, Any]:
-        hits = await rag.query(payload.text, top_k=payload.top_k, source=payload.source, tags=payload.tags)
+    async def rag_query(payload: QueryRequest, actor: Actor = Depends(get_actor)) -> dict[str, Any]:
+        hits = await rag.query(
+            payload.text,
+            top_k=payload.top_k,
+            source=payload.source,
+            tags=payload.tags,
+            viewer_id=actor.user.id,
+            is_admin=actor.is_admin,
+            scopes=payload.scope,
+        )
         return {
             "hits": [
                 {"id": h.id, "score": h.score, "text": h.text, "metadata": h.metadata}
@@ -1182,9 +1219,9 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         }
 
     @app.get("/rag/stats")
-    async def rag_stats() -> dict[str, Any]:
+    async def rag_stats(actor: Actor = Depends(get_actor)) -> dict[str, Any]:
         try:
-            return await rag.stats()
+            return await rag.stats(viewer_id=actor.user.id, is_admin=actor.is_admin)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=503, detail=f"RAG stats failed: {e}")
 
@@ -1193,32 +1230,48 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         source: str | None = None,
         tag: str | None = None,
         limit: int = 200,
+        scope: str | None = None,
+        actor: Actor = Depends(get_actor),
     ) -> dict[str, Any]:
+        scopes = [s.strip() for s in scope.split(",")] if scope else None
         try:
-            cards = await rag.list_documents(source=source, tag=tag, limit=limit)
+            cards = await rag.list_documents(
+                source=source,
+                tag=tag,
+                limit=limit,
+                viewer_id=actor.user.id,
+                is_admin=actor.is_admin,
+                scopes=scopes,
+            )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=503, detail=f"RAG list failed: {e}")
         return {"documents": cards}
 
     @app.post("/rag/chunks")
-    async def rag_chunks(payload: dict[str, Any]) -> dict[str, Any]:
+    async def rag_chunks(payload: dict[str, Any], actor: Actor = Depends(get_actor)) -> dict[str, Any]:
         ids = payload.get("ids") or payload.get("chunk_ids") or []
         if not isinstance(ids, list):
             raise HTTPException(status_code=400, detail="ids must be a list")
         try:
-            chunks = await rag.get_chunks([str(i) for i in ids])
+            chunks = await rag.get_chunks(
+                [str(i) for i in ids],
+                viewer_id=actor.user.id,
+                is_admin=actor.is_admin,
+            )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=503, detail=f"RAG chunks failed: {e}")
         return {"chunks": chunks}
 
     @app.delete("/rag/documents")
-    async def rag_delete(payload: dict[str, Any]) -> dict[str, Any]:
+    async def rag_delete(payload: dict[str, Any], actor: Actor = Depends(get_actor)) -> dict[str, Any]:
         try:
             return await rag.delete(
                 chunk_ids=payload.get("chunk_ids"),
                 source=payload.get("source"),
                 doc_id=payload.get("doc_id"),
                 tag=payload.get("tag"),
+                viewer_id=actor.user.id,
+                is_admin=actor.is_admin,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
