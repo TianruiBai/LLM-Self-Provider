@@ -1,0 +1,32 @@
+# Self-hosted Model Provider — Python dependencies.
+#
+# Install into the venv that runs `python -m provider`:
+#     python -m venv .venv
+#     .venv\Scripts\activate              # Windows PowerShell
+#     pip install -r requirements.txt
+#
+# A separate llama.cpp build (CUDA) is required and is **not** managed via
+# pip. See the README and `provider/models.yaml` for the path to the
+# `llama-server.exe` binary.
+
+# ---- Core gateway ----
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.6
+httpx>=0.27
+pyyaml>=6.0
+
+# ---- RAG (MongoDB Atlas Local + vector index) ----
+pymongo>=4.9
+
+# ---- Model download via /admin/fetch-model ----
+huggingface_hub>=0.24
+
+# ---- Document text extraction for /admin/extract and the document tools ----
+# Plain text files (.txt, .md, .csv, .json, source code, etc.) work without
+# these extras — they only kick in for richer formats.
+pypdf>=4.0          # .pdf
+python-docx>=1.1    # .docx
+python-pptx>=0.6.23 # .pptx
+openpyxl>=3.1       # .xlsx / .xlsm
+# .rtf / .epub / .odt / .odp / .ods are extracted with stdlib only.
