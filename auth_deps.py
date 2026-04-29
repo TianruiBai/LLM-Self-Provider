@@ -191,6 +191,7 @@ class AuthMiddleware:
         "/auth/recovery-codes",
         "/auth/users",
         "/auth/sessions",
+        "/auth/admin/",
     )
 
     def __init__(self, app):

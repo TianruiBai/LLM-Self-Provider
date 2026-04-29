@@ -225,6 +225,12 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     from provider.audit import AuditMiddleware
     app.add_middleware(AuditMiddleware)
 
+    # Rate-limit middleware: token-bucket per-user / per-IP. Installed before
+    # AuthMiddleware so that, after the middleware stack is reversed by
+    # ``add_middleware`` ordering, ratelimit runs *after* auth resolution.
+    from provider.ratelimit_mw import RateLimitMiddleware
+    app.add_middleware(RateLimitMiddleware)
+
     # Authentication middleware: resolves the caller (Bearer API key or
     # session cookie) onto ``request.state.actor`` and rejects unauthenticated
     # access to protected route prefixes (/v1/*, /admin/*, /rag/*, /events,

@@ -530,4 +530,65 @@ async def admin_audit_summary(
     }
 
 
+# --------------------------------------------------- admin: rate limits
+
+class RateLimitIn(BaseModel):
+    capacity: float = Field(gt=0)
+    refill_per_s: float = Field(gt=0)
+
+
+@router.get("/admin/ratelimit")
+async def admin_ratelimit_list(_admin: Actor = Depends(require_admin)) -> dict[str, Any]:
+    from . import ratelimit as rl
+    rows = await asyncio.to_thread(
+        db.fetchall,
+        "SELECT key, value FROM config_kv WHERE key LIKE 'ratelimit.%' ORDER BY key",
+    )
+    overrides = {}
+    for r in rows:
+        try:
+            import json as _json
+            overrides[r["key"][len("ratelimit."):]] = _json.loads(r["value"])
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "defaults": {k: {"capacity": v[0], "refill_per_s": v[1]} for k, v in rl.DEFAULTS.items()},
+        "overrides": overrides,
+    }
+
+
+@router.put("/admin/ratelimit/{policy}")
+async def admin_ratelimit_set(policy: str, payload: RateLimitIn,
+                              admin: Actor = Depends(require_admin)) -> dict[str, Any]:
+    if not policy.replace(".", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="invalid policy name")
+    import json as _json
+    val = _json.dumps({"capacity": payload.capacity, "refill_per_s": payload.refill_per_s})
+    db.execute(
+        """
+        INSERT INTO config_kv(key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by
+        """,
+        (f"ratelimit.{policy}", val, db.now_ts(), admin.user.id),
+    )
+    return {"ok": True, "policy": policy, "capacity": payload.capacity, "refill_per_s": payload.refill_per_s}
+
+
+@router.delete("/admin/ratelimit/{policy}")
+async def admin_ratelimit_clear(policy: str, _admin: Actor = Depends(require_admin)) -> dict[str, Any]:
+    cur = db.execute("DELETE FROM config_kv WHERE key=?", (f"ratelimit.{policy}",))
+    return {"deleted": cur.rowcount}
+
+
+@router.post("/admin/ratelimit/reset")
+async def admin_ratelimit_reset_bucket(payload: dict = Body(...),
+                                       _admin: Actor = Depends(require_admin)) -> dict[str, Any]:
+    bucket = (payload.get("bucket") or "").strip()
+    if not bucket:
+        raise HTTPException(status_code=400, detail="bucket required")
+    from . import ratelimit as rl
+    rl.reset(bucket)
+    return {"ok": True, "bucket": bucket}
+
+
 __all__ = ["router"]
