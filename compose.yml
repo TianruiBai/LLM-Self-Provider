@@ -9,101 +9,30 @@
 #   PROVIDER_BOOTSTRAP_ADMIN_USER — first admin username, created on first run
 #   PROVIDER_BOOTSTRAP_ADMIN_PASSWORD
 #   HF_TOKEN                       — optional, required for gated models
-#   VLLM_CHAT_MODEL                — HF repo id; leave blank to skip vllm-chat
-#   VLLM_EMBED_MODEL               — HF repo id; leave blank to skip vllm-embed
-#   VLLM_VISION_MODEL              — HF repo id; leave blank to skip vllm-vision
-#   VLLM_GPU_UTIL                  — 0..1, default 0.85
 #
-# By default `docker compose up` only starts the gateway. To also start the
-# vLLM workers (after setting the *_MODEL env vars), use:
-#     docker compose --profile vllm up -d
+# Inference is performed by sibling **llama-server** containers spawned on
+# demand by the gateway (see provider/llama_runner.py). The image is built
+# from the antirez ``llama.cpp-deepseek-v4-flash`` fork, which supports
+# DeepSeek-V4-Flash on top of upstream model coverage.
 #
-# A typical layout uses one Docker volume for HF cache, one for Lance, and one
-# for the SQLite control DB so backups can target a single tree.
+# Build the inference image once before first use:
+#     docker compose --profile build-llama build llama-server
+# (or just ``make build-llama``).
 
 services:
-  vllm-chat:
-    image: vllm/vllm-openai:v0.6.0
-    profiles: ["vllm"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: 1
-    runtime: nvidia
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    command: >
-      --model ${VLLM_CHAT_MODEL}
-      --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
-      --max-model-len 32768
-      --enable-auto-tool-choice
-      --tool-call-parser hermes
-    volumes:
-      - hf-cache:/root/.cache/huggingface
-    ports:
-      - "8001:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-
-  vllm-embed:
-    image: vllm/vllm-openai:v0.6.0
-    profiles: ["vllm"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: 1
-    runtime: nvidia
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    command: >
-      --model ${VLLM_EMBED_MODEL}
-      --task embed
-      --gpu-memory-utilization 0.5
-    volumes:
-      - hf-cache:/root/.cache/huggingface
-    ports:
-      - "8002:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-
-  vllm-vision:
-    image: vllm/vllm-openai:v0.6.0
-    profiles: ["vllm"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: 1
-    runtime: nvidia
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    command: >
-      --model ${VLLM_VISION_MODEL}
-      --gpu-memory-utilization 0.4
-      --max-model-len 8192
-    volumes:
-      - hf-cache:/root/.cache/huggingface
-    ports:
-      - "8003:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
+  # Build-only service: produces ``provider-llama-server:local``, the image
+  # spawned per slot by the gateway's llama_runner. Never started as a
+  # long-running service — sibling containers handle that.
+  llama-server:
+    profiles: ["build-llama"]
+    image: provider-llama-server:local
+    build:
+      context: ../llama.cpp-deepseek-v4-flash
+      dockerfile: .devops/cuda.Dockerfile
+      target: server
+      args:
+        CUDA_VERSION: "12.8.1"
+    command: ["--help"]
 
   gateway:
     build:
@@ -126,16 +55,49 @@ services:
       PROVIDER_OIDC_GITHUB_CLIENT_SECRET: ${PROVIDER_OIDC_GITHUB_CLIENT_SECRET:-}
       PROVIDER_OIDC_GOOGLE_CLIENT_ID: ${PROVIDER_OIDC_GOOGLE_CLIENT_ID:-}
       PROVIDER_OIDC_GOOGLE_CLIENT_SECRET: ${PROVIDER_OIDC_GOOGLE_CLIENT_SECRET:-}
-      # vLLM sibling-container runner: the gateway shells the docker daemon
-      # via the bind-mounted socket to start a swappable vllm/vllm-openai
-      # container per slot (chat / embed). The sibling needs the same paths
-      # the gateway discovered, so we forward the host LM Studio dir.
+      # Sibling-container llama.cpp runner: the gateway shells the docker
+      # daemon via the bind-mounted socket to start a swappable
+      # ``provider-llama-server`` container per slot (chat / embed). The
+      # sibling needs the same paths the gateway discovered, so we forward
+      # the host LM Studio dir.
       LMSTUDIO_HOST_DIR: ${LMSTUDIO_DIR:-${HOME:-/root}/.lmstudio/models}
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-provider}_default
       HF_CACHE_VOLUME: ${COMPOSE_PROJECT_NAME:-provider}_hf-cache
-      VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
-      VLLM_GPU_UTIL: ${VLLM_GPU_UTIL:-0.85}
-      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      LLAMA_IMAGE: ${LLAMA_IMAGE:-provider-llama-server:local}
+      # Default sibling-container context window. 163840 = the
+      # DeepSeek-V4-Flash "stable-164k" target; ordinary GGUFs that report
+      # a lower trained ctx will be capped by llama-server itself, so
+      # raising this default doesn't hurt smaller models.
+      LLAMA_CTX_SIZE: ${LLAMA_CTX_SIZE:-163840}
+      LLAMA_NGL: ${LLAMA_NGL:-999}
+      # Dual-GPU dispatch policy. CUDA0 (RTX PRO 4000) is reserved for the
+      # main chat workload; CUDA1 is reserved for helpers (embeddings,
+      # Gemma E4B vision pre-processor, Qwen sub-agent). The runner refuses
+      # to launch chat-kind models on the helper GPU even when an operator
+      # hand-pins ``--device CUDA1`` in models.yaml.
+      PROVIDER_CHAT_GPU: ${PROVIDER_CHAT_GPU:-CUDA0}
+      PROVIDER_HELPER_GPU: ${PROVIDER_HELPER_GPU:-CUDA1}
+      # Per-user chat container budget. With 1 (default) only one chat
+      # container runs at a time across all users; LRU-evict makes room
+      # for the next request. Raise on multi-GPU hosts.
+      LLAMA_CHAT_MAX_CONCURRENT: ${LLAMA_CHAT_MAX_CONCURRENT:-1}
+      # Hard cap on how many CUDA1 helper containers (embed / sub_agent /
+      # vision) may run at once. Default 2 matches the user policy of
+      # "at most two helpers on the small GPU at any time".
+      LLAMA_HELPER_MAX_CONCURRENT: ${LLAMA_HELPER_MAX_CONCURRENT:-2}
+      # Per-runner-container memory cap. On Windows / Docker Desktop a
+      # runaway llama-server can otherwise consume the entire WSL2 VM and
+      # take Hyper-V down with it. Empty disables the cap. Default 48g
+      # leaves headroom on a 64 GB host; tune to your machine.
+      LLAMA_MEM_LIMIT: ${LLAMA_MEM_LIMIT:-48g}
+      # Private SHM size per runner. We no longer share the host IPC
+      # namespace (which was the proximate cause of the hypervisor wedge),
+      # so 1g is plenty for single-GPU llama.cpp.
+      LLAMA_SHM_SIZE: ${LLAMA_SHM_SIZE:-1g}
+      # On Windows + WSL2, mmap-ing large GGUFs from a host bind mount can
+      # race the GPU paravirt driver and crash Hyper-V. Set to 1 if you
+      # see hypervisor wedges when loading 27B+ models. Default off.
+      LLAMA_NO_MMAP: ${LLAMA_NO_MMAP:-0}
       HF_TOKEN: ${HF_TOKEN:-}
     ports:
       - "8088:8088"

@@ -21,7 +21,7 @@ from typing import Optional
 import httpx
 
 from .registry import ModelConfig, ProviderConfig
-from .vllm_runner import VllmRunner
+from .llama_runner import LlamaRunner
 
 log = logging.getLogger("provider.lifecycle")
 
@@ -95,16 +95,68 @@ class LifecycleManager:
         # can publish an activity event. Set by ``LifecycleManager.set_idle_callback``.
         self._idle_callback = None
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
-        # Sibling-container vLLM runner for swappable LM Studio GGUFs.
-        self._vllm = VllmRunner()
+        # Sibling-container llama-server runner for swappable LM Studio GGUFs.
+        self._llama = LlamaRunner()
+        # Container-backed slots use a flexible naming scheme so we can run
+        # one chat container per authenticated user (slot ``chat-<user>``)
+        # while keeping the helpers (``embed`` / ``sub_agent`` / ``vision``)
+        # as singletons shared across the box. ``_container_active`` is
+        # keyed by the full slot string and holds ``{role, model_id}``.
+        self._container_active: dict[str, dict[str, str | None]] = {}
+        # LRU order of chat user_keys with a live container. Most-recently
+        # used at the end. Used to evict when ``_chat_max_concurrent`` is
+        # exceeded so per-user containers don't OOM the host.
+        self._chat_user_lru: list[str] = []
+        try:
+            self._chat_max_concurrent = max(
+                1, int(os.environ.get("LLAMA_CHAT_MAX_CONCURRENT", "1"))
+            )
+        except ValueError:
+            self._chat_max_concurrent = 1
+        # Hard cap on helpers running concurrently on CUDA1 (embed / sub_agent
+        # / vision). Acquired by ``acquire_helper`` and released by
+        # ``release_helper`` after each /v1/* request finishes, so helpers
+        # evict immediately and never pile more than two on the small GPU.
+        try:
+            helper_cap = max(
+                1, int(os.environ.get("LLAMA_HELPER_MAX_CONCURRENT", "2"))
+            )
+        except ValueError:
+            helper_cap = 2
+        self._helper_sema = asyncio.Semaphore(helper_cap)
+        self._helper_cap = helper_cap
+
+    @staticmethod
+    def _user_key(user_key: str | None) -> str:
+        """Normalise a user identifier for use as a slot suffix.
+
+        Empty / ``None`` collapses to ``"shared"`` so unauthenticated
+        startup paths (RAG warmup, idle watchdog) all share one bucket.
+        """
+        if not user_key:
+            return "shared"
+        s = str(user_key).strip().lower()
+        # Keep this in sync with llama_runner._sanitize_slot.
+        import re as _re
+        s = _re.sub(r"[^a-z0-9_-]+", "-", s).strip("-_")
+        return (s or "shared")[:32]
+
+    def _chat_slot(self, user_key: str | None) -> str:
+        return f"chat-{self._user_key(user_key)}"
 
     # ---------------- public API ----------------
 
     async def startup(self) -> None:
         # Embedder, sub-agent and vision helper are spawned lazily on first
-        # use to keep the small GPU (CUDA0 / RTX 4070 Laptop) free until
-        # something needs it. Start the idle watchdog so they also get torn
-        # down again when nothing has used them for a while.
+        # use to keep the helper GPU (CUDA1) free until something needs it.
+        # CUDA0 (RTX PRO 4000) is reserved for the main chat workload. The
+        # idle watchdog still tears down stale local-subprocess helpers; the
+        # container-backed path uses immediate-after-request eviction
+        # instead (see ``release_helper``).
+        # Repopulate sibling-container state from any containers left
+        # running by a previous gateway process so the UI's "active chat
+        # model" pill and Eject button reflect reality immediately.
+        await self._reconcile_container_state()
         idle_after = getattr(self.cfg.server, "idle_unload_after_s", 0) or 0
         if idle_after > 0:
             self._idle_task = asyncio.create_task(self._idle_watchdog(idle_after))
@@ -129,8 +181,13 @@ class LifecycleManager:
         an activity event."""
         self._idle_callback = cb
 
-    async def ensure_chat(self, model_id: str) -> str:
-        """Ensure the named chat model is the active one. Returns base URL.
+    async def ensure_chat(self, model_id: str, user_key: str | None = None) -> str:
+        """Ensure the named chat model is the active one for ``user_key``.
+
+        Each authenticated user gets their own sibling container
+        (``provider-llama-runner-chat-<user>``) so two users can run
+        different chat models concurrently. ``user_key=None`` collapses
+        to a shared ``"shared"`` bucket for unauthenticated callers.
 
         Any non-embedding model is accepted as a chat target: ``chat``,
         ``vision`` (multimodal), and ``sub_agent`` models all expose
@@ -140,15 +197,19 @@ class LifecycleManager:
         if cfg.kind == "embedding":
             raise ValueError(f"Model {model_id!r} is an embedding model and cannot serve chat")
 
-        # Phase C — vLLM-backed models live as a separate Docker service.
-        # We never spawn a child for them; we just hand the endpoint back.
-        if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
-            # If a llama-server child is currently active, stop it so VRAM
-            # frees up before vLLM gets traffic.
+        # Sibling-container backends (llama-server, optional vLLM) live as
+        # separate Docker services managed by ``LlamaRunner``. We never spawn
+        # a local child for them; we just hand the endpoint back.
+        if self._is_container_backend(cfg):
+            slot = self._chat_slot(user_key)
+            await self._enforce_chat_budget(slot)
+            ep = await self._resolve_container_endpoint(cfg, slot=slot)
+            self._touch_chat_lru(slot)
+            # If a llama-server child process is currently active, stop it so
+            # VRAM frees up before the sibling container gets traffic.
             async with self._chat_lock:
                 if self._chat is not None:
-                    log.info("Switching to vLLM chat backend; ejecting %s", self._chat.model.id)
+                    log.info("Switching to container chat backend; ejecting %s", self._chat.model.id)
                     self._terminate(self._chat)
                     self._chat = None
             return ep.rstrip("/")
@@ -165,24 +226,55 @@ class LifecycleManager:
             await self._spawn_chat(cfg)
             return self._chat_base_url()
 
-    async def unload_chat(self) -> Optional[str]:
-        """Stop the active chat child if any. Returns the id that was unloaded."""
+    async def unload_chat(self, user_key: str | None = None) -> Optional[str]:
+        """Stop the active chat child if any. Returns the id that was unloaded.
+
+        ``user_key`` selects which user's per-user container to evict for the
+        sibling-container backend; ``None`` means "any chat container" and
+        falls back to the most-recently-used one. Local subprocess children
+        ignore the user_key (single global slot).
+        """
         async with self._chat_lock:
-            if self._chat is None:
-                return None
-            mid = self._chat.model.id
-            log.info("Ejecting chat model %s", mid)
-            self._terminate(self._chat)
-            self._chat = None
-            return mid
+            # Local subprocess child path (legacy).
+            if self._chat is not None:
+                mid = self._chat.model.id
+                log.info("Ejecting chat model %s", mid)
+                self._terminate(self._chat)
+                self._chat = None
+                return mid
+            # Container-backed path: pick the slot.
+            slots: list[str]
+            if user_key is not None:
+                slots = [self._chat_slot(user_key)]
+            else:
+                # Best-effort: try the MRU chat slot first, then any other
+                # known chat slots so eject works even when state was lost.
+                slots = list(reversed(self._chat_user_lru)) or [
+                    s for s in self._container_active.keys() if s.startswith("chat-")
+                ]
+            for slot in slots:
+                active = self._container_active.get(slot) or {}
+                role = active.get("role")
+                mid = active.get("model_id")
+                if mid is not None and role in ("chat", "sub_agent", "vision"):
+                    log.info("Ejecting container chat model %s (slot=%s, role=%s)", mid, slot, role)
+                    await self._llama.stop(slot)
+                    self._container_active.pop(slot, None)
+                    if slot in self._chat_user_lru:
+                        self._chat_user_lru.remove(slot)
+                    return mid
+            return None
 
     async def ensure_sub_agent(self) -> str:
         """Ensure the sub-agent process is running. Returns its base URL."""
         cfg = self.cfg.sub_agent_model
         if cfg is None:
             raise RuntimeError("No sub_agent model configured")
-        if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
+        if self._is_container_backend(cfg):
+            # Sub-agent gets its own runner slot pinned to CUDA1 so it can
+            # be evicted independently from the main chat container the
+            # moment its job finishes (release_helper).
+            ep = await self._resolve_container_endpoint(cfg, slot="sub_agent")
             return ep.rstrip("/")
         async with self._sub_agent_lock:
             if self._sub_agent is not None and self._sub_agent.alive():
@@ -195,8 +287,8 @@ class LifecycleManager:
         cfg = self.cfg.embedding_model
         if cfg is None:
             raise RuntimeError("No embedding model configured")
-        if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            ep = await self._resolve_vllm_endpoint(cfg, slot="embed")
+        if self._is_container_backend(cfg):
+            ep = await self._resolve_container_endpoint(cfg, slot="embed")
             return ep.rstrip("/")
         async with self._embed_lock:
             self._embed_last_use = time.time()
@@ -210,8 +302,10 @@ class LifecycleManager:
         cfg = self.cfg.vision_model
         if cfg is None:
             raise RuntimeError("No vision model configured")
-        if getattr(cfg, "backend", "llama_cpp") == "vllm":
-            ep = await self._resolve_vllm_endpoint(cfg, slot="chat")
+        if self._is_container_backend(cfg):
+            # Dedicated runner slot on CUDA1 so eviction-after-use doesn't
+            # take down a co-tenant chat container.
+            ep = await self._resolve_container_endpoint(cfg, slot="vision")
             return ep.rstrip("/")
         async with self._vision_lock:
             self._vision_last_use = time.time()
@@ -227,59 +321,249 @@ class LifecycleManager:
     def touch_embedder(self) -> None:
         self._embed_last_use = time.time()
 
-    async def _resolve_vllm_endpoint(self, cfg: ModelConfig, slot: str) -> str:
-        """Return the base URL for a ``backend=="vllm"`` model.
+    @staticmethod
+    def _is_container_backend(cfg: ModelConfig) -> bool:
+        """Return True when ``cfg`` is served by a sibling Docker container.
 
-        If ``cfg.endpoint`` is a ``vllm-runner://`` sentinel, ask the
-        sibling-container runner to ensure a vLLM container is up with the
-        requested GGUF; otherwise just hand the static endpoint back.
-        Per-model overrides (``ctx_size``, ``extra_args``) from the
-        ``model_publish`` table are forwarded to the runner.
+        That covers both the modern ``llama-runner://`` sentinel and the
+        legacy ``vllm-runner://`` / ``backend=="vllm"`` setups (kept for
+        backward compatibility with older ``models.yaml`` files).
         """
-        ep = cfg.endpoint
-        runner_slot = self._vllm.parse_endpoint(ep)
+        if getattr(cfg, "backend", "llama_cpp") == "vllm":
+            return True
+        ep = getattr(cfg, "endpoint", None) or ""
+        return ep.startswith("llama-runner://") or ep.startswith("vllm-runner://")
+
+    async def _resolve_container_endpoint(self, cfg: ModelConfig, slot: str) -> str:
+        """Return the base URL for a sibling-container model.
+
+        If ``cfg.endpoint`` is a ``llama-runner://`` (or legacy
+        ``vllm-runner://``) sentinel, ask the runner to ensure a sibling
+        llama-server container is up with the requested GGUF; otherwise
+        just hand the static endpoint back. Per-model overrides
+        (``ctx_size``, ``extra_args``) from the ``model_publish`` table
+        are forwarded to the runner.
+        """
+        ep = cfg.endpoint or ""
+        # Legacy ``vllm-runner://`` sentinels are now handled by the
+        # llama-server runner — operators that haven't reset their LM Studio
+        # registrations get a transparent migration.
+        runner_slot = self._llama.parse_endpoint(ep)
+        if runner_slot is None and ep.startswith("vllm-runner://"):
+            runner_slot = ep[len("vllm-runner://"):].strip("/").split("/")[0] or None
         if runner_slot is not None:
             override = _load_model_override(cfg.id)
-            return await self._vllm.ensure(
+            ep_url = await self._llama.ensure(
                 slot,
                 cfg.path,
                 cfg.kind,
                 extra_args=override.get("extra_args"),
                 ctx_size=override.get("ctx_size"),
+                mmproj=getattr(cfg, "mmproj", None),
             )
+            # Remember which model id (and role) is parked in this slot so
+            # that subsequent ``unload_*`` / ``active_*_model`` calls can
+            # find and stop the right sibling container.
+            role = (
+                "embedding" if cfg.kind == "embedding"
+                else "sub_agent" if cfg.kind == "sub_agent"
+                else "vision" if cfg.kind == "vision"
+                else "chat"
+            )
+            self._container_active[slot] = {"role": role, "model_id": cfg.id}
+            return ep_url
         if not ep:
-            raise RuntimeError(f"vLLM model {cfg.id!r} has no endpoint configured")
+            raise RuntimeError(f"Container-backed model {cfg.id!r} has no endpoint configured")
         return ep
 
     async def unload_embedder(self) -> Optional[str]:
         async with self._embed_lock:
-            if self._embed is None:
-                return None
-            mid = self._embed.model.id
-            log.info("Ejecting embedder %s", mid)
-            self._terminate(self._embed)
-            self._embed = None
-            return mid
+            if self._embed is not None:
+                mid = self._embed.model.id
+                log.info("Ejecting embedder %s", mid)
+                self._terminate(self._embed)
+                self._embed = None
+                return mid
+            active = self._container_active.get("embed") or {}
+            mid = active.get("model_id")
+            if mid is not None:
+                log.info("Ejecting container embedder %s", mid)
+                await self._llama.stop("embed")
+                self._container_active.pop("embed", None)
+                return mid
+            return None
 
     async def unload_sub_agent(self) -> Optional[str]:
         async with self._sub_agent_lock:
-            if self._sub_agent is None:
-                return None
-            mid = self._sub_agent.model.id
-            log.info("Ejecting sub-agent %s", mid)
-            self._terminate(self._sub_agent)
-            self._sub_agent = None
-            return mid
+            if self._sub_agent is not None:
+                mid = self._sub_agent.model.id
+                log.info("Ejecting sub-agent %s", mid)
+                self._terminate(self._sub_agent)
+                self._sub_agent = None
+                return mid
+            active = self._container_active.get("sub_agent") or {}
+            mid = active.get("model_id")
+            if mid is not None:
+                log.info("Ejecting container sub-agent %s", mid)
+                await self._llama.stop("sub_agent")
+                self._container_active.pop("sub_agent", None)
+                return mid
+            return None
 
     async def unload_vision(self) -> Optional[str]:
         async with self._vision_lock:
-            if self._vision is None:
-                return None
-            mid = self._vision.model.id
-            log.info("Ejecting vision helper %s", mid)
-            self._terminate(self._vision)
-            self._vision = None
-            return mid
+            if self._vision is not None:
+                mid = self._vision.model.id
+                log.info("Ejecting vision helper %s", mid)
+                self._terminate(self._vision)
+                self._vision = None
+                return mid
+            active = self._container_active.get("vision") or {}
+            mid = active.get("model_id")
+            if mid is not None:
+                log.info("Ejecting container vision helper %s", mid)
+                await self._llama.stop("vision")
+                self._container_active.pop("vision", None)
+                return mid
+            return None
+
+    # ---------------- state reconciliation ----------------
+
+    async def _reconcile_container_state(self) -> None:
+        """Rehydrate ``_container_active`` + ``_chat_user_lru`` from any
+        sibling containers left running by a previous gateway process.
+
+        Without this, after a gateway restart ``active_chat_model()``
+        returns ``None`` (so the UI shows "no model loaded" and the Eject
+        button is greyed out) even though VRAM is still occupied. We rely
+        on the ``provider.slot`` / ``provider.model_path`` labels written
+        in :meth:`LlamaRunner._create_and_start`.
+        """
+        try:
+            client = self._llama._docker()
+            containers = await asyncio.to_thread(
+                client.containers.list, all=False,
+                filters={"label": "provider.slot"},
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("container reconciliation skipped (no docker)", exc_info=True)
+            return
+        for c in containers or []:
+            try:
+                lbl = c.labels or {}
+                slot = lbl.get("provider.slot") or ""
+                kind = lbl.get("provider.kind") or ""
+                model_path = lbl.get("provider.model_path") or ""
+                if not slot or not model_path:
+                    continue
+                # Map model_path back to a configured model id (best effort).
+                model_id = next(
+                    (m.id for m in self.cfg.models if m.path == model_path),
+                    None,
+                )
+                if not model_id:
+                    continue
+                role = (
+                    "embedding" if kind == "embedding"
+                    else "sub_agent" if kind == "sub_agent"
+                    else "vision" if kind == "vision"
+                    else "chat"
+                )
+                self._container_active[slot] = {"role": role, "model_id": model_id}
+                if slot.startswith("chat-"):
+                    self._touch_chat_lru(slot)
+                # Mirror the runner's internal state so subsequent stop()
+                # calls find the container.
+                from .llama_runner import _SlotState
+                self._llama._states[slot] = _SlotState(
+                    container_id=c.id,
+                    model_path=model_path,
+                    endpoint=f"http://{c.name}:{self._llama.port}",
+                )
+                log.info("Reconciled container slot=%s model=%s", slot, model_id)
+            except Exception:  # noqa: BLE001
+                log.warning("failed to reconcile container", exc_info=True)
+
+    # ---------------- helper concurrency / immediate-evict ----------------
+
+    async def acquire_helper(self, role: str) -> None:
+        """Block until a CUDA1 helper slot is free (max ``LLAMA_HELPER_MAX_CONCURRENT``).
+
+        Pair with :meth:`release_helper` in a try/finally so the semaphore
+        always gets returned, even when the upstream request errors out.
+        """
+        await self._helper_sema.acquire()
+
+    async def release_helper(self, role: str, *, evict: bool = True) -> None:
+        """Release the CUDA1 helper slot.
+
+        When ``evict`` is true (default), also tears the helper container
+        down so the small GPU is freed for the next task. Tolerates
+        repeated calls and missing containers.
+        """
+        try:
+            if evict:
+                try:
+                    if role == "embedding":
+                        await self.unload_embedder()
+                    elif role == "sub_agent":
+                        await self.unload_sub_agent()
+                    elif role == "vision":
+                        await self.unload_vision()
+                except Exception:  # noqa: BLE001
+                    log.warning("release_helper(%s) eviction failed", role, exc_info=True)
+        finally:
+            try:
+                self._helper_sema.release()
+            except ValueError:
+                # Released more times than acquired — shouldn't happen but
+                # don't crash the gateway over it.
+                pass
+
+    # ---------------- chat container LRU / budget ----------------
+
+    def _touch_chat_lru(self, slot: str) -> None:
+        if slot in self._chat_user_lru:
+            self._chat_user_lru.remove(slot)
+        self._chat_user_lru.append(slot)
+
+    async def _enforce_chat_budget(self, want_slot: str) -> None:
+        """Evict LRU chat containers when the budget would be exceeded.
+
+        ``LLAMA_CHAT_MAX_CONCURRENT`` (default 1) caps how many sibling
+        chat containers can run at once across all users so we don't
+        accidentally OOM the host when N users connect.
+        """
+        active = [s for s in self._chat_user_lru if s != want_slot]
+        # Reserve one slot for the incoming request.
+        while len(active) >= self._chat_max_concurrent:
+            victim = active.pop(0)
+            log.info("Chat-container budget exceeded; evicting LRU slot %s", victim)
+            try:
+                await self._llama.stop(victim)
+            except Exception:  # noqa: BLE001
+                log.warning("LRU eviction of %s failed", victim, exc_info=True)
+            self._container_active.pop(victim, None)
+            if victim in self._chat_user_lru:
+                self._chat_user_lru.remove(victim)
+
+    # ---------------- llama-runner admin pass-throughs ----------------
+
+    async def runner_status(self, slot: str) -> dict:
+        """Return current sibling-container state for ``slot`` ("chat"/"embed")."""
+        return await self._llama.status(slot)
+
+    async def runner_logs(self, slot: str, n: int = 200) -> str:
+        """Return tail of the slot's container logs (or last failure tail)."""
+        return await self._llama.tail_logs(slot, n=n)
+
+    async def runner_stop(self, slot: str) -> None:
+        """Stop and remove the slot's sibling container; clear failure latch."""
+        await self._llama.stop(slot)
+
+    def runner_reset(self, slot: str) -> bool:
+        """Clear the sticky failure latch for ``slot`` so retries are allowed."""
+        return self._llama.reset_failure(slot)
 
     def chat_base_url(self) -> Optional[str]:
         if self._chat and self._chat.alive():
@@ -304,16 +588,31 @@ class LifecycleManager:
     def active_chat_model(self) -> Optional[str]:
         if self._chat and self._chat.alive():
             return self._chat.model.id
+        # Most-recently-used chat container wins for the global pill. A
+        # multi-modal (vision-kind) or sub_agent model selected as the
+        # user's chat target also occupies a chat-* slot, so accept those
+        # roles here too — otherwise the UI thinks no model is loaded and
+        # the Eject button stays disabled.
+        for slot in reversed(self._chat_user_lru):
+            active = self._container_active.get(slot) or {}
+            if active.get("role") in ("chat", "sub_agent", "vision"):
+                return active.get("model_id")
         return None
 
     def active_sub_agent_model(self) -> Optional[str]:
         if self._sub_agent and self._sub_agent.alive():
             return self._sub_agent.model.id
+        active = self._container_active.get("sub_agent") or {}
+        if active.get("role") == "sub_agent":
+            return active.get("model_id")
         return None
 
     def active_vision_model(self) -> Optional[str]:
         if self._vision and self._vision.alive():
             return self._vision.model.id
+        active = self._container_active.get("vision") or {}
+        if active.get("role") == "vision":
+            return active.get("model_id")
         return None
 
     # ---------------- internals ----------------
@@ -496,8 +795,10 @@ class LifecycleManager:
         """Periodically unload the embedder + vision helper if they have been
         idle for ``idle_after`` seconds. Runs forever until cancelled.
 
-        Both helpers live on the small GPU (CUDA0 by convention), so this is
-        what keeps the RTX 4070 Laptop free between bursts of activity.
+        Both helpers live on the helper GPU (CUDA1 in the dual-GPU setup).
+        Container-backed deployments rely on ``release_helper`` for
+        immediate post-request eviction; this watchdog only handles the
+        local-subprocess fallback.
         """
         try:
             while True:

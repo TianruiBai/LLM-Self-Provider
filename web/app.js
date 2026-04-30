@@ -10,6 +10,20 @@ const THEME_KEY = "provider.theme.v1";
 const PENDING_ATTACH = []; // image attachments for the next message
 const PENDING_DOCS = [];   // [{name, ext, format, text, size}] document attachments
 
+function newId() {
+  const c = globalThis.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  if (c?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 // ---------------- markdown ----------------
 if (window.marked) {
   marked.setOptions({
@@ -176,10 +190,10 @@ function activeConv() {
 }
 function newConv(model, opts = {}) {
   const c = {
-    id: crypto.randomUUID(),
+    id: newId(),
     title: opts.title || "New chat",
     model: model || (state.models[0]?.id ?? ""),
-    messages: opts.messages ? opts.messages.map(m => ({ ...m, id: m.id || crypto.randomUUID() })) : [],
+    messages: opts.messages ? opts.messages.map(m => ({ ...m, id: m.id || newId() })) : [],
     parentId: opts.parentId || null,
     createdAt: Date.now(),
   };
@@ -560,7 +574,7 @@ function renderMessages() {
 }
 
 function appendMessageDom(m) {
-  if (!m.id) m.id = crypto.randomUUID();
+  if (!m.id) m.id = newId();
   const box = $("#messages");
   const wrap = document.createElement("div");
   wrap.className = `msg ${m.role}`;
@@ -740,7 +754,7 @@ function branchFromMessage(mid) {
   if (!c) return;
   const idx = c.messages.findIndex(x => x.id === mid);
   if (idx < 0) return;
-  const cloned = c.messages.slice(0, idx + 1).map(m => ({ ...m, id: crypto.randomUUID() }));
+  const cloned = c.messages.slice(0, idx + 1).map(m => ({ ...m, id: newId() }));
   newConv(c.model, {
     title: (c.title || "Branch") + " — branch",
     messages: cloned,
@@ -826,7 +840,7 @@ async function sendMessage() {
     PENDING_DOCS.length = 0;
   }
 
-  const userMsg = { role: "user", content: composedContent, displayContent: text || "(documents attached)", id: crypto.randomUUID() };
+  const userMsg = { role: "user", content: composedContent, displayContent: text || "(documents attached)", id: newId() };
   if (docsForMsg) userMsg.docs = docsForMsg;
   if (docsForApi) userMsg.docsPayload = docsForApi;
   if (PENDING_ATTACH.length) {
@@ -894,7 +908,7 @@ async function sendMessage() {
     body.documents = allDocs;
   }
 
-  const asstMsg = { role: "assistant", content: "", reasoning: "", id: crypto.randomUUID() };
+  const asstMsg = { role: "assistant", content: "", reasoning: "", id: newId() };
   c.messages.push(asstMsg);
   const dom = appendMessageDom(asstMsg);
   const cursor = document.createElement("span");

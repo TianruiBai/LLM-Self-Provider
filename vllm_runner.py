@@ -251,7 +251,12 @@ class VllmRunner:
 
         cmd = _merge_vllm_args(defaults, extra_args)
 
-        env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        env = {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            # Allow --max-model-len above the model's native window so users
+            # can opt into YaRN / long-context overrides via extra_args.
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+        }
         if os.environ.get("HF_TOKEN"):
             env["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
 

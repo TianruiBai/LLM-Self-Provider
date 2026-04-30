@@ -95,18 +95,45 @@ def pick_device(role: Role, *, small_threshold_mib: int = 9000) -> str | None:
     """Return ``"CUDA<n>"`` to assign to a model with the given role, or
     ``None`` if no GPU is available (caller should leave llama-server to
     auto-detect or fall back to CPU).
+
+    Dispatch policy (dual-GPU host: CUDA0 = main / RTX PRO 4000,
+    CUDA1 = helper):
+
+      * ``chat``                            → CUDA0 (big card, never CUDA1)
+      * ``embed`` / ``sub_agent`` / ``vision`` → CUDA1 (helper card)
+
+    The mapping can be overridden per-role via env:
+
+      * ``PROVIDER_CHAT_GPU``    (default ``CUDA0``)
+      * ``PROVIDER_HELPER_GPU``  (default ``CUDA1``)
+
+    On single-GPU boxes the only available device wins for every role.
     """
     gpus = list_gpus()
     if not gpus:
         return None
+    if len(gpus) == 1:
+        return gpus[0].device_id
+
+    chat_pref = os.environ.get("PROVIDER_CHAT_GPU", "CUDA0").strip().upper()
+    helper_pref = os.environ.get("PROVIDER_HELPER_GPU", "CUDA1").strip().upper()
+    available = {g.device_id for g in gpus}
 
     if role == "chat":
-        big = max(gpus, key=lambda g: g.vram_mib)
-        return big.device_id
+        # Hard guard: never let a chat / >27B model land on the helper GPU.
+        if chat_pref in available and chat_pref != helper_pref:
+            return chat_pref
+        # Fallback: the biggest card that isn't the helper, or biggest overall.
+        non_helper = [g for g in gpus if g.device_id != helper_pref]
+        pool = non_helper or gpus
+        return max(pool, key=lambda g: g.vram_mib).device_id
 
-    # Helpers prefer the smallest sub-threshold device so the big GPU stays
-    # free for the chat model. Fall back to the smallest device overall, and
-    # finally to the only GPU we have.
+    # Helper roles: embed / sub_agent / vision must never share CUDA0
+    # with the big chat model when a helper GPU exists.
+    if helper_pref in available and helper_pref != chat_pref:
+        return helper_pref
+    # No dedicated helper GPU configured: fall back to the smallest sub-
+    # threshold card, then the smallest card overall.
     small = [g for g in gpus if g.vram_mib < small_threshold_mib]
     if small:
         return min(small, key=lambda g: g.vram_mib).device_id

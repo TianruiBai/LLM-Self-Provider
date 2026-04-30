@@ -163,7 +163,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI):
         log.info("Starting provider service")
         # Hook the idle watchdog into the activity event bus so the UI
-        # learns when CUDA0 helpers get auto-evicted.
+        # learns when CUDA1 helpers get auto-evicted.
         def _on_idle_unload(kind: str, model_id: str) -> None:
             evt = "embedder.unloaded" if kind == "embedding" else (
                 "vision.unloaded" if kind == "vision" else "sub_agent.unloaded"
@@ -183,6 +183,8 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             await lifecycle.shutdown()
 
     app = FastAPI(title="Self-hosted Model Provider", version="0.1.0", lifespan=lifespan)
+    ui_version = "20260430a"
+    ui_url = f"/ui/?v={ui_version}"
 
     # CORS — allow OpenAI clients from anywhere (VS Code webviews, browser tools, etc.)
     app.add_middleware(
@@ -214,6 +216,14 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             async def send_wrapper(message):
                 if message.get("type") == "http.response.start":
                     status_holder["code"] = int(message.get("status", 0))
+                    if path.startswith("/ui/"):
+                        raw_headers = list(message.get("headers", []))
+                        raw_headers.extend([
+                            (b"cache-control", b"no-store, no-cache, must-revalidate"),
+                            (b"pragma", b"no-cache"),
+                            (b"expires", b"0"),
+                        ])
+                        message = {**message, "headers": raw_headers}
                 await send(message)
 
             try:
@@ -306,8 +316,10 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         }
 
     @app.post("/admin/unload")
-    async def admin_unload() -> dict[str, Any]:
-        unloaded = await lifecycle.unload_chat()
+    async def admin_unload(req: Request) -> dict[str, Any]:
+        _actor = getattr(req.state, "actor", None)
+        _uk = _actor.user.id if (_actor and getattr(_actor, "user", None)) else None
+        unloaded = await lifecycle.unload_chat(user_key=_uk)
         bus.publish({"type": "model.unloaded", "model": unloaded})
         return {"unloaded": unloaded, "active_chat_model": lifecycle.active_chat_model()}
 
@@ -328,6 +340,49 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         unloaded = await lifecycle.unload_vision()
         bus.publish({"type": "vision.unloaded", "model": unloaded})
         return {"unloaded": unloaded}
+
+    # ---- llama-runner sibling-container admin ----------
+    # Visibility & control for the swappable llama-server containers managed
+    # by ``provider.llama_runner.LlamaRunner``. Without these the only way to
+    # see why a container exited (bad CLI flag, OOM, …) was to ``docker logs``
+    # by hand, and there was no way to clear the sticky failure latch that
+    # prevents respawn loops on misconfiguration.
+
+    _RUNNER_SLOT_PREFIXES = ("chat-",)
+    _RUNNER_SLOT_LITERALS = {"embed", "sub_agent", "vision"}
+
+    def _check_runner_slot(slot: str) -> None:
+        if slot in _RUNNER_SLOT_LITERALS:
+            return
+        if any(slot.startswith(p) for p in _RUNNER_SLOT_PREFIXES):
+            return
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Unknown runner slot: {slot!r}")
+
+    @app.get("/admin/runner/{slot}/status")
+    async def admin_runner_status(slot: str) -> dict[str, Any]:
+        _check_runner_slot(slot)
+        return await lifecycle.runner_status(slot)
+
+    @app.get("/admin/runner/{slot}/logs")
+    async def admin_runner_logs(slot: str, n: int = 200) -> dict[str, Any]:
+        _check_runner_slot(slot)
+        n = max(1, min(int(n), 5000))
+        return {"slot": slot, "n": n, "logs": await lifecycle.runner_logs(slot, n=n)}
+
+    @app.post("/admin/runner/{slot}/stop")
+    async def admin_runner_stop(slot: str) -> dict[str, Any]:
+        _check_runner_slot(slot)
+        await lifecycle.runner_stop(slot)
+        bus.publish({"type": "runner.stopped", "slot": slot})
+        return {"stopped": slot}
+
+    @app.post("/admin/runner/{slot}/reset")
+    async def admin_runner_reset(slot: str) -> dict[str, Any]:
+        _check_runner_slot(slot)
+        cleared = lifecycle.runner_reset(slot)
+        bus.publish({"type": "runner.reset", "slot": slot, "cleared": cleared})
+        return {"slot": slot, "cleared": cleared}
 
     # ---------------- model download ----------------
 
@@ -455,78 +510,88 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail="only admins can ingest into the global KB")
         style = payload.get("style") or "concise"
         unload_after = bool(payload.get("unload_after", True))
+        # CUDA1 helper: cap concurrency. The function already evicts via
+        # unload_sub_agent when ``unload_after`` is true, so the outer
+        # release_helper just returns the semaphore in that case.
+        await lifecycle.acquire_helper("sub_agent")
         try:
-            base = await lifecycle.ensure_sub_agent()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail=f"Sub-agent failed to start: {e}")
-        sys_prompt = (
-            "You are a careful summarizer. Produce a faithful, well-structured summary "
-            f"in {style} style. Preserve key facts, named entities, and numeric values. "
-            "Use markdown with headings and bullet points. Do not invent facts."
-        )
-        sub_id = cfg.sub_agent_model.id
-        try:
-            r = await proxy_client.post(
-                f"{base}/v1/chat/completions",
-                json={
-                    "model": sub_id,
-                    "messages": [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": text},
-                    ],
-                    "stream": False,
-                    "temperature": float(payload.get("temperature", 0.3)),
-                    "max_tokens": int(payload.get("max_tokens", 1024)),
-                },
-                timeout=httpx.Timeout(60.0, read=600.0),
-            )
-        except Exception as e:  # noqa: BLE001
-            if unload_after:
-                try:
-                    await lifecycle.unload_sub_agent()
-                except Exception:  # noqa: BLE001
-                    log.warning("auto-unload sub_agent after summarize error failed", exc_info=True)
-            raise HTTPException(status_code=502, detail=f"Sub-agent request failed: {e}") from e
-        if r.status_code >= 400:
-            if unload_after:
-                try:
-                    await lifecycle.unload_sub_agent()
-                except Exception:  # noqa: BLE001
-                    log.warning("auto-unload sub_agent failed", exc_info=True)
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        j = r.json()
-        summary = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        if not summary:
-            if unload_after:
-                try:
-                    await lifecycle.unload_sub_agent()
-                except Exception:  # noqa: BLE001
-                    log.warning("auto-unload sub_agent failed", exc_info=True)
-            raise HTTPException(status_code=502, detail="Sub-agent returned empty summary")
-        doc_id = f"{title}-{int(time.time())}"
-        try:
-            ingest_res = await rag.ingest(
-                [{"text": summary, "metadata": {"id": doc_id, "title": title}}],
-                source=source,
-                tags=tags,
-                owner_id=actor.user.id if scope == SCOPE_USER else None,
-                scope=scope,
-            )
-        except Exception as e:  # noqa: BLE001
-            if unload_after:
-                try:
-                    await lifecycle.unload_sub_agent()
-                except Exception:  # noqa: BLE001
-                    log.warning("auto-unload sub_agent failed", exc_info=True)
-            return {"summary": summary, "doc_id": doc_id, "ingested": False, "error": str(e)}
-        bus.publish({"type": "summary.ingested", "doc_id": doc_id, "source": source, "title": title})
-        if unload_after:
             try:
-                await lifecycle.unload_sub_agent()
-                bus.publish({"type": "sub_agent.unloaded", "model": sub_id, "reason": "auto_after_summarize"})
-            except Exception:  # noqa: BLE001
-                log.warning("auto-unload sub_agent after summarize failed", exc_info=True)
-        return {"summary": summary, "doc_id": doc_id, "title": title, "source": source, "tags": tags, "ingested": True, "ingest": ingest_res, "unloaded": unload_after}
+                base = await lifecycle.ensure_sub_agent()
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(status_code=503, detail=f"Sub-agent failed to start: {e}")
+            sys_prompt = (
+                "You are a careful summarizer. Produce a faithful, well-structured summary "
+                f"in {style} style. Preserve key facts, named entities, and numeric values. "
+                "Use markdown with headings and bullet points. Do not invent facts."
+            )
+            sub_id = cfg.sub_agent_model.id
+            try:
+                r = await proxy_client.post(
+                    f"{base}/v1/chat/completions",
+                    json={
+                        "model": sub_id,
+                        "messages": [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": text},
+                        ],
+                        "stream": False,
+                        "temperature": float(payload.get("temperature", 0.3)),
+                        "max_tokens": int(payload.get("max_tokens", 1024)),
+                    },
+                    timeout=httpx.Timeout(60.0, read=600.0),
+                )
+            except Exception as e:  # noqa: BLE001
+                if unload_after:
+                    try:
+                        await lifecycle.unload_sub_agent()
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-unload sub_agent after summarize error failed", exc_info=True)
+                raise HTTPException(status_code=502, detail=f"Sub-agent request failed: {e}") from e
+            if r.status_code >= 400:
+                if unload_after:
+                    try:
+                        await lifecycle.unload_sub_agent()
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-unload sub_agent failed", exc_info=True)
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+            j = r.json()
+            summary = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+            if not summary:
+                if unload_after:
+                    try:
+                        await lifecycle.unload_sub_agent()
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-unload sub_agent failed", exc_info=True)
+                raise HTTPException(status_code=502, detail="Sub-agent returned empty summary")
+            doc_id = f"{title}-{int(time.time())}"
+            try:
+                ingest_res = await rag.ingest(
+                    [{"text": summary, "metadata": {"id": doc_id, "title": title}}],
+                    source=source,
+                    tags=tags,
+                    owner_id=actor.user.id if scope == SCOPE_USER else None,
+                    scope=scope,
+                )
+            except Exception as e:  # noqa: BLE001
+                if unload_after:
+                    try:
+                        await lifecycle.unload_sub_agent()
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-unload sub_agent failed", exc_info=True)
+                return {"summary": summary, "doc_id": doc_id, "ingested": False, "error": str(e)}
+            bus.publish({"type": "summary.ingested", "doc_id": doc_id, "source": source, "title": title})
+            if unload_after:
+                try:
+                    await lifecycle.unload_sub_agent()
+                    bus.publish({"type": "sub_agent.unloaded", "model": sub_id, "reason": "auto_after_summarize"})
+                except Exception:  # noqa: BLE001
+                    log.warning("auto-unload sub_agent after summarize failed", exc_info=True)
+            return {"summary": summary, "doc_id": doc_id, "title": title, "source": source, "tags": tags, "ingested": True, "ingest": ingest_res, "unloaded": unload_after}
+        finally:
+            # The handler already calls unload_sub_agent above when
+            # ``unload_after`` is true, so don't double-evict here \u2014 just
+            # return the helper semaphore.
+            await lifecycle.release_helper("sub_agent", evict=False)
 
     # ---------------- live activity stream (SSE) ----------------
 
@@ -738,15 +803,22 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     @app.post("/v1/embeddings")
     async def embeddings(req: Request) -> JSONResponse:
         body = await req.json()
+        # Acquire a CUDA1 helper slot (cap = LLAMA_HELPER_MAX_CONCURRENT, default 2)
+        # then evict immediately after the response is built so the helper
+        # GPU is free for the next task.
+        await lifecycle.acquire_helper("embedding")
         try:
-            base = await lifecycle.ensure_embedder()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail=f"Failed to start embedder: {e}")
-        # Force the registered embedder model id regardless of what's requested.
-        if cfg.embedding_model is not None:
-            body["model"] = cfg.embedding_model.id
-        r = await proxy_client.post(f"{base}/v1/embeddings", json=body)
-        return JSONResponse(status_code=r.status_code, content=r.json())
+            try:
+                base = await lifecycle.ensure_embedder()
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(status_code=503, detail=f"Failed to start embedder: {e}")
+            # Force the registered embedder model id regardless of what's requested.
+            if cfg.embedding_model is not None:
+                body["model"] = cfg.embedding_model.id
+            r = await proxy_client.post(f"{base}/v1/embeddings", json=body)
+            return JSONResponse(status_code=r.status_code, content=r.json())
+        finally:
+            await lifecycle.release_helper("embedding", evict=True)
 
     # ---------------- /v1/chat/completions ----------------
 
@@ -801,6 +873,17 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
         if mcfg.kind == "embedding":
             raise HTTPException(status_code=400, detail=f"Model {model_id!r} is an embedding model and cannot serve chat")
+
+        # Per-user llama-server container key. Authenticated callers each get
+        # their own ``provider-llama-runner-chat-<user>`` so two users can
+        # run different chat models concurrently (subject to the global
+        # ``LLAMA_CHAT_MAX_CONCURRENT`` budget).
+        _actor_for_user = getattr(req.state, "actor", None)
+        user_key = (
+            _actor_for_user.user.id
+            if (_actor_for_user and getattr(_actor_for_user, "user", None))
+            else None
+        )
 
         # Non-admins may only invoke models the admin has explicitly published.
         if not _viewer_is_admin(req):
@@ -875,7 +958,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
 
         # Vision pre-processing: when the active chat model has no `mmproj`
         # of its own but the request carries image / audio parts, route those
-        # through the small Gemma helper on CUDA0 to extract a text
+        # through the small Gemma helper on CUDA1 to extract a text
         # description first, then forward the rewritten messages upstream.
         # Skip when the user picked a multimodal model directly as their
         # chat target — it already handles images natively.
@@ -886,16 +969,22 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             and not mcfg.mmproj
             and cfg.vision_model is not None
         ):
+            # Cap CUDA1 concurrency, evict the vision container immediately
+            # after captioning so the small GPU is freed for the next task.
+            await lifecycle.acquire_helper("vision")
             try:
-                vision_used = await _preprocess_multimodal(body, model_id)
-            except Exception as e:  # noqa: BLE001
-                log.warning("vision preprocessing failed: %s", e, exc_info=True)
+                try:
+                    vision_used = await _preprocess_multimodal(body, model_id)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("vision preprocessing failed: %s", e, exc_info=True)
+            finally:
+                await lifecycle.release_helper("vision", evict=True)
 
         try:
             if mcfg.kind == "sub_agent":
                 base = await lifecycle.ensure_sub_agent()
             else:
-                base = await lifecycle.ensure_chat(model_id)
+                base = await lifecycle.ensure_chat(model_id, user_key=user_key)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=503, detail=f"Failed to start model {model_id}: {e}")
 
@@ -1476,11 +1565,13 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     # ---------------- model swap (admin) ----------------
 
     @app.post("/admin/load")
-    async def admin_load(payload: dict[str, Any]) -> dict[str, Any]:
+    async def admin_load(payload: dict[str, Any], req: Request) -> dict[str, Any]:
         model_id = payload.get("model")
         if not model_id:
             raise HTTPException(status_code=400, detail="`model` is required")
-        await lifecycle.ensure_chat(model_id)
+        _actor = getattr(req.state, "actor", None)
+        _uk = _actor.user.id if (_actor and getattr(_actor, "user", None)) else None
+        await lifecycle.ensure_chat(model_id, user_key=_uk)
         return {"active_chat_model": lifecycle.active_chat_model()}
 
     # ---------------- built-in tools catalog ----------------
@@ -1539,7 +1630,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
 
         @app.get("/", include_in_schema=False)
         async def _root_redirect() -> RedirectResponse:
-            return RedirectResponse(url="/ui/")
+            return RedirectResponse(url=ui_url)
     else:
         log.warning("web UI directory not found: %s", web_dir)
 

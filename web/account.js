@@ -575,7 +575,7 @@
               </label>
               <label>Context size
                 <input type="number" data-field="ctx_size" value="${escapeHtml(String(ctx))}" placeholder="default" min="512" step="512">
-                <span class="hint">Maps to <code>--max-model-len</code> for vLLM, <code>-c</code> for llama.cpp.</span>
+                <span class="hint">Maps to <code>--ctx-size</code> for llama-server (and <code>--max-model-len</code> for legacy vLLM).</span>
               </label>
             </div>
           </div>
@@ -584,12 +584,23 @@
             <div class="acct-model-section-title">Runtime args</div>
             ${m.backend === "vllm" ? `
               <div class="acct-presets">
-                <span class="hint">Quick presets:</span>
+                <span class="hint">vLLM presets:</span>
                 <button type="button" class="ghost xs" data-preset="qwen3">+ Qwen3 reasoning</button>
                 <button type="button" class="ghost xs" data-preset="qwen3-tools">+ Qwen3 tool calling</button>
                 <button type="button" class="ghost xs" data-preset="prefix-cache">+ Prefix caching</button>
                 <button type="button" class="ghost xs" data-preset="trust-remote">+ Trust remote code</button>
-              </div>` : ""}
+                <button type="button" class="ghost xs" data-preset="gguf-hf-config">+ GGUF: use HF config/tokenizer</button>
+                <button type="button" class="ghost xs" data-preset="qwen3-yarn">+ Qwen3 ultra-long (YaRN ×4)</button>
+              </div>` : `
+              <div class="acct-presets">
+                <span class="hint">llama-server presets:</span>
+                <button type="button" class="ghost xs" data-preset="flash-attn">+ Flash attention</button>
+                <button type="button" class="ghost xs" data-preset="cont-batching">+ Continuous batching</button>
+                <button type="button" class="ghost xs" data-preset="gpu-cuda1">+ Pin to CUDA1</button>
+                <button type="button" class="ghost xs" data-preset="split-layer">+ Dual-GPU layer split</button>
+                <button type="button" class="ghost xs" data-preset="deepseek-v4-stable">+ DeepSeek-V4 stable-164k</button>
+                <button type="button" class="ghost xs" data-preset="mlock">+ mlock (pin to RAM)</button>
+              </div>`}
             <textarea data-field="extra_args" rows="6" spellcheck="false"
               placeholder="One token per line, e.g.&#10;--reasoning-parser&#10;qwen3&#10;--enable-prefix-caching">${escapeHtml(extra)}</textarea>
             <span class="hint">Each line is one CLI token. Flag and value go on separate lines. Overrides the gateway defaults.</span>
@@ -624,13 +635,99 @@
   }
 
   const _PRESETS = {
+    // vLLM (legacy)
     "qwen3":         ["--reasoning-parser", "qwen3"],
     "qwen3-tools":   ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder"],
     "prefix-cache":  ["--enable-prefix-caching"],
     "trust-remote":  ["--trust-remote-code"],
+    // llama-server (default backend)
+    "flash-attn":    ["--flash-attn"],
+    "cont-batching": ["--cont-batching", "--parallel", "4"],
+    "gpu-cuda1":     ["--device", "CUDA1"],
+    "split-layer":   ["--device", "CUDA1,CUDA0", "--split-mode", "layer"],
+    "deepseek-v4-stable": [
+      "--device", "CUDA1", "--split-mode", "none",
+      "--fit-target", "1024", "--ctx-size", "167936",
+      "--batch-size", "64", "--ubatch-size", "64",
+      "--parallel", "1", "--no-cont-batching", "--no-warmup",
+    ],
+    "mlock":         ["--mlock"],
   };
 
+  // GGUF preset is special — it needs the HF repo id, which we ask for.
+  function applyGgufHfConfigPreset(row) {
+    const repo = prompt(
+      "Enter the HuggingFace repo id whose config + tokenizer to use\n" +
+      "(e.g. Qwen/Qwen3.6-35B-A3B or Qwen/Qwen3.5-30B-A3B):"
+    );
+    if (!repo) return;
+    const ta = row.querySelector('textarea[data-field="extra_args"]');
+    if (!ta) return;
+    const cur = ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const want = ["--hf-config-path", repo, "--tokenizer", repo, "--trust-remote-code"];
+    // Replace any existing --hf-config-path / --tokenizer pairs first.
+    const stripFlags = new Set(["--hf-config-path", "--tokenizer"]);
+    const merged = [];
+    for (let i = 0; i < cur.length; i++) {
+      if (stripFlags.has(cur[i])) { i++; continue; }
+      merged.push(cur[i]);
+    }
+    for (const tok of want) {
+      if (!merged.includes(tok)) merged.push(tok);
+    }
+    ta.value = merged.join("\n");
+  }
+
+  // Qwen3 ultra-long-context preset: enable YaRN x4 (262k -> ~1M tokens).
+  // Mirrors the recipe from the vLLM Qwen3.5/3.6 guide.
+  function applyQwen3YarnPreset(row) {
+    const factorStr = prompt(
+      "YaRN scaling factor (4 = 1,010,000 tokens, 2 = 524k, 1 = native 262k):",
+      "4"
+    );
+    if (!factorStr) return;
+    const factor = parseFloat(factorStr);
+    if (!Number.isFinite(factor) || factor < 1) {
+      alert("Factor must be a number >= 1.");
+      return;
+    }
+    const original = 262144;
+    const newCtx = Math.floor(original * factor);
+    const overrides = {
+      text_config: {
+        rope_parameters: {
+          mrope_interleaved: true,
+          mrope_section: [11, 11, 10],
+          rope_type: "yarn",
+          rope_theta: 10000000,
+          partial_rotary_factor: 0.25,
+          factor: factor,
+          original_max_position_embeddings: original,
+        },
+      },
+    };
+    const overridesJson = JSON.stringify(overrides);
+    const ta = row.querySelector('textarea[data-field="extra_args"]');
+    if (!ta) return;
+    const cur = ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    // Strip any prior --hf-overrides / --max-model-len pairs and rewrite.
+    const stripFlags = new Set(["--hf-overrides", "--max-model-len"]);
+    const merged = [];
+    for (let i = 0; i < cur.length; i++) {
+      if (stripFlags.has(cur[i])) { i++; continue; }
+      merged.push(cur[i]);
+    }
+    merged.push("--hf-overrides", overridesJson);
+    merged.push("--max-model-len", String(newCtx));
+    ta.value = merged.join("\n");
+    // Reflect the new ctx in the input as well so the user sees it.
+    const ctxInput = row.querySelector('input[data-field="ctx_size"]');
+    if (ctxInput) ctxInput.value = String(newCtx);
+  }
+
   function applyPreset(row, name) {
+    if (name === "gguf-hf-config") { applyGgufHfConfigPreset(row); return; }
+    if (name === "qwen3-yarn")     { applyQwen3YarnPreset(row); return; }
     const ta = row.querySelector('textarea[data-field="extra_args"]');
     if (!ta) return;
     const cur = ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);

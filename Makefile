@@ -1,6 +1,6 @@
 # D4 — Convenience targets. All targets assume `docker compose` v2.
 
-.PHONY: up down logs restart pull migrate backup rotate-keys ps health smoke
+.PHONY: up down logs restart pull migrate backup rotate-keys ps health smoke build-llama
 
 up:
 	docker compose up -d
@@ -22,6 +22,9 @@ ps:
 
 health:
 	@curl -fsS http://127.0.0.1:8088/health || echo "gateway is not responding"
+
+build-llama:
+	docker compose --profile build-llama build llama-server
 
 migrate:
 	docker compose exec gateway python -m provider.scripts.migrate_mongo_to_lance \

@@ -17,16 +17,16 @@ deploys.
                 │ • RAG augment + kb_search tool                           │
                 └──┬──────────────────┬───────────────────┬────────────────┘
                    │                  │                   │
-        backend=vllm│       llama_cpp │           rag.backend=lance
+        llama-runner://│  local binary  │           rag.backend=lance
                    ▼                  ▼                   ▼
             ┌─────────────┐    ┌──────────────┐   ┌────────────────────┐
-            │  vLLM       │    │ llama-server │   │  LanceDB on disk   │
-            │  containers │    │ (CUDA/Vulkan │   │  per-tenant tables │
-            │  chat /     │    │  child proc) │   │  kb_global,        │
-            │  embed /    │    │  one-at-a-   │   │  kb_user_<id>      │
-            │  vision     │    │  time swap   │   │  hybrid: dense+FTS │
-            └─────────────┘    └──────────────┘   │  + RRF fusion      │
-                                                   └────────────────────┘
+            │ llama-server│    │ llama-server │   │  LanceDB on disk   │
+            │ containers  │    │ (CUDA/Vulkan │   │  per-tenant tables │
+            │ chat /      │    │  child proc) │   │  kb_global,        │
+            │ embed       │    │  one-at-a-   │   │  kb_user_<id>      │
+            │ (DeepSeek-V4│    │  time swap)  │   │  hybrid: dense+FTS │
+            │  fork)      │    └──────────────┘   │  + RRF fusion      │
+            └─────────────┘                       └────────────────────┘
                                             ▲
                                             │
                               ┌─────────────┴────────────┐
@@ -44,13 +44,15 @@ deploys.
 - **OpenAI wire-compatible.** Anything that talks `Authorization: Bearer
   sk-…` to `/v1/chat/completions` works (Continue, Cline, `openai-python`,
   curl).
-- **Two inference backends, picked per-model in `models.yaml`:**
-  - `backend: llama_cpp` (default) — spawns/swaps `llama-server` children;
-    a swap-on-demand `LifecycleManager` keeps exactly one chat model
-    resident plus persistent embedder + sub-agent + vision processes.
-  - `backend: vllm` — the gateway treats the model as an OpenAI-compatible
-    upstream (typically a Docker compose service). vLLM's continuous
-    batching means one resident server handles many concurrent users.
+- **Inference: swappable `llama-server` sibling containers.** Built from
+  the antirez `llama.cpp-deepseek-v4-flash` fork, so the same image
+  serves DeepSeek-V4-Flash *and* every other GGUF in your LM Studio
+  cache. The gateway holds the docker socket and starts/swaps one
+  container per slot (`chat`, `embed`) on demand. See
+  [docs/LLAMA_CPP_CONTAINER.md](docs/LLAMA_CPP_CONTAINER.md) for the build
+  command, knobs, and migration notes from the older vLLM architecture.
+  A legacy local-binary `llama-server` path remains for setups where
+  Docker isn't available.
 - **LM Studio model autodiscovery.** GGUFs under
   `~/.lmstudio/models/<pub>/<model>/*.gguf` are auto-registered as
   `lmstudio/<pub>/<model>` ids. They stay invisible to end users until an
@@ -142,7 +144,7 @@ python -m provider --host 127.0.0.1 --port 8088
 The first admin lands at `/ui/` and can publish models, create users,
 issue keys, and view the audit log.
 
-## Quick start (Docker / vLLM backend)
+## Quick start (Docker / llama-server backend)
 
 ```bash
 cd provider
@@ -157,22 +159,34 @@ The installer:
 2. Generates `provider/.env` with random `PROVIDER_AUTH_PEPPER` and
    `PROVIDER_MASTER_KEY`.
 3. Prompts for the first admin username and password.
-4. `docker compose pull && docker compose up -d`.
+4. Builds the inference image once: `make build-llama` (compiles the
+   antirez `llama.cpp-deepseek-v4-flash` fork against CUDA).
+5. `docker compose up -d`.
 
-`provider/compose.yml` brings up four services: `vllm-chat` (8001),
-`vllm-embed` (8002), `vllm-vision` (8003), and `gateway` (8088). Volumes
-`hf-cache`, `control-db` and `lance` persist between rebuilds. The gateway
-mounts `provider/models.docker.yaml` over `/app/provider/models.yaml`,
-which is configured for `rag.backend: lance` and the three vLLM models.
+`provider/compose.yml` brings up the **gateway** (8088) plus a build-only
+`llama-server` service that produces the
+`provider-llama-server:local` image. The gateway then spawns one sibling
+container per slot on demand (`provider-llama-runner-chat`,
+`provider-llama-runner-embed`) using the bind-mounted Docker socket.
+Volumes `hf-cache`, `control-db` and `lance` persist between rebuilds.
+The gateway mounts `provider/models.docker.yaml` over
+`/app/provider/models.yaml`, which is configured for `rag.backend: lance`
+and auto-discovers GGUFs from `~/.lmstudio/models`.
+
+See [docs/LLAMA_CPP_CONTAINER.md](docs/LLAMA_CPP_CONTAINER.md) for build
+options, CLI knobs (`LLAMA_IMAGE`, `LLAMA_CTX_SIZE`, `LLAMA_NGL`), preset
+buttons in the web UI, and migration notes from the older vLLM
+sibling-container architecture.
 
 Convenience targets in `provider/Makefile`:
 
 ```bash
-make up         # docker compose up -d
-make logs       # tail gateway logs
-make migrate    # Mongo -> Lance one-shot
-make backup     # tarball of control.db + lance/ + .env (sans password)
-make smoke      # run all phase smoke tests against the source tree
+make up           # docker compose up -d
+make build-llama  # build provider-llama-server:local from the fork
+make logs         # tail gateway logs
+make migrate      # Mongo -> Lance one-shot
+make backup       # tarball of control.db + lance/ + .env (sans password)
+make smoke        # run all phase smoke tests against the source tree
 ```
 
 ## API surface (highlights)
@@ -226,7 +240,7 @@ provider/
 ├── vector_store.py         LanceDB hybrid vector + FTS + RRF
 ├── tools.py                Built-in tool catalog (kb_search, web, code…)
 ├── db.py / migrations/     SQLite control plane + schema migrations
-├── compose.yml             Docker stack (vLLM + gateway)
+├── compose.yml             Docker stack (llama-server build + gateway)
 ├── Dockerfile              Gateway image
 ├── models.yaml             Local-dev model registry
 ├── models.docker.yaml      Docker registry (mounted over models.yaml)
@@ -244,7 +258,7 @@ provider/
   rate limit, admin user CRUD.
 - **B** ✅ — LanceDB store, hybrid retrieval, `kb_search` tool, Mongo →
   Lance migration, backend selector.
-- **C** ✅ — vLLM-backed inference, per-user concurrency cap, Docker stack.
+- **C** ✅ — swappable llama-server containers (DeepSeek-V4 fork), per-user concurrency cap, Docker stack.
 - **D** ✅ — installers (sh/ps1), Makefile, backup script, healthchecks.
 
 Detailed design + outstanding decisions live in

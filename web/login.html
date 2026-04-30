@@ -88,6 +88,7 @@ const $ = (s) => document.querySelector(s);
 const errEl = $("#lg-err"), okEl = $("#lg-ok");
 let mode = "login";   // 'login' | 'bootstrap'
 let totpRequired = false;
+const UI_URL = "/ui/?v=20260430a";
 
 function setError(msg) { errEl.textContent = msg || ""; okEl.textContent = ""; }
 function setOk(msg)    { okEl.textContent  = msg || ""; errEl.textContent = ""; }
@@ -99,7 +100,7 @@ async function detectMode() {
     const j = await r.json();
     if (j.authenticated) {
       // Already signed in — go to the app.
-      window.location.replace("/ui/");
+      window.location.replace(UI_URL);
       return;
     }
     if (j.bootstrap) {
@@ -135,7 +136,7 @@ $("#login-form").addEventListener("submit", async (ev) => {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.detail || "Bootstrap failed."); return; }
       setOk("Admin created — entering app…");
-      window.location.replace("/ui/");
+      window.location.replace(UI_URL);
       return;
     }
 
@@ -159,7 +160,7 @@ $("#login-form").addEventListener("submit", async (ev) => {
       setError(j.detail || "Sign-in failed.");
       return;
     }
-    window.location.replace("/ui/");
+    window.location.replace(UI_URL);
   } finally {
     btn.disabled = false;
   }
