@@ -7,6 +7,8 @@ const STORAGE_KEY = "provider.conversations.v1";
 const ACTIVE_KEY = "provider.activeId.v1";
 const SETTINGS_KEY = "provider.settings.v1";
 const THEME_KEY = "provider.theme.v1";
+const PRIVATE_TOGGLE_KEY = "provider.privateMode.v1";   // sessionStorage (tab-scoped)
+const PRIVATE_CONVS_KEY = "provider.privateConvs.v1";   // sessionStorage (tab-scoped)
 const PENDING_ATTACH = []; // image attachments for the next message
 const PENDING_DOCS = [];   // [{name, ext, format, text, size}] document attachments
 
@@ -168,14 +170,132 @@ let state = {
 };
 
 function loadConversations() {
+  // Initial paint uses local cache for instant feel; bootstrap() then
+  // hydrates from /conversations/all and re-renders. Private (tab-scoped)
+  // conversations live in sessionStorage and are merged in alongside.
+  let local = [];
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
+    local = raw ? JSON.parse(raw) : [];
+  } catch { local = []; }
+  let priv = [];
+  try {
+    const raw = sessionStorage.getItem(PRIVATE_CONVS_KEY);
+    priv = raw ? JSON.parse(raw) : [];
+  } catch { priv = []; }
+  // Tag private convs defensively in case sessionStorage was hand-edited.
+  for (const c of priv) c.private = true;
+  return [...priv, ...local];
 }
-function saveConversations() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.conversations));
+
+// Per-conversation debounce timers for server upserts.
+const _syncTimers = new Map();
+const _SYNC_DEBOUNCE_MS = 600;
+
+function _persistLocal() {
+  // localStorage = non-private only; sessionStorage = private only (tab).
+  const pub = state.conversations.filter(c => !c.private);
+  const priv = state.conversations.filter(c => c.private);
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(pub)); } catch {}
+  try { sessionStorage.setItem(PRIVATE_CONVS_KEY, JSON.stringify(priv)); } catch {}
   if (state.activeId) localStorage.setItem(ACTIVE_KEY, state.activeId);
+}
+
+function _scheduleServerSync(convId) {
+  if (!convId) return;
+  const c = state.conversations.find(x => x.id === convId);
+  if (!c || c.private) return;
+  const prev = _syncTimers.get(convId);
+  if (prev) clearTimeout(prev);
+  const t = setTimeout(() => {
+    _syncTimers.delete(convId);
+    _pushConvToServer(convId).catch(err => console.warn("conv sync failed", convId, err));
+  }, _SYNC_DEBOUNCE_MS);
+  _syncTimers.set(convId, t);
+}
+
+async function _pushConvToServer(convId) {
+  const c = state.conversations.find(x => x.id === convId);
+  if (!c || c.private) return;
+  const body = {
+    id: c.id,
+    title: c.title || "",
+    model: c.model || "",
+    created_at: c.createdAt || Date.now(),
+    updated_at: Date.now(),
+    data: c,
+  };
+  const r = await fetch(`/conversations/${encodeURIComponent(c.id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    credentials: "same-origin",
+  });
+  if (!r.ok && r.status !== 401) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
+}
+
+async function _deleteConvOnServer(convId) {
+  try {
+    await fetch(`/conversations/${encodeURIComponent(convId)}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+  } catch (e) {
+    console.warn("conv delete failed", convId, e);
+  }
+}
+
+function saveConversations() {
+  _persistLocal();
+  // Push every non-private conv that has a pending mutation; in practice the
+  // caller has just touched activeConv(), so syncing the active id is
+  // sufficient + cheap. A full-sync helper exists below for bulk operations.
+  if (state.activeId) _scheduleServerSync(state.activeId);
+}
+
+// Force-sync a specific conversation now (no debounce). Used after
+// large operations (e.g. delete) to keep the server tidy.
+async function syncConversationNow(convId) {
+  const t = _syncTimers.get(convId);
+  if (t) { clearTimeout(t); _syncTimers.delete(convId); }
+  const c = state.conversations.find(x => x.id === convId);
+  if (!c || c.private) return;
+  try { await _pushConvToServer(convId); } catch (e) { console.warn("conv sync failed", convId, e); }
+}
+
+async function hydrateConversationsFromServer() {
+  try {
+    const r = await fetch("/conversations/all", { credentials: "same-origin" });
+    if (!r.ok) {
+      if (r.status === 401) return false;
+      throw new Error(`HTTP ${r.status}`);
+    }
+    const j = await r.json();
+    const remote = (j.items || []).map(it => {
+      // Prefer the embedded conv object (round-tripped client shape).
+      const conv = (it.data && typeof it.data === "object") ? { ...it.data } : {};
+      conv.id = it.id;
+      conv.title = it.title || conv.title || "New chat";
+      conv.model = it.model || conv.model || "";
+      conv.createdAt = conv.createdAt || it.created_at || Date.now();
+      if (!Array.isArray(conv.messages)) conv.messages = [];
+      delete conv.private; // server convs are never private
+      return conv;
+    });
+    // Keep tab-local private convs; replace public set with server truth.
+    const priv = state.conversations.filter(c => c.private);
+    state.conversations = [...priv, ...remote];
+    // Sort newest-first by createdAt for stable sidebar order.
+    state.conversations.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    _persistLocal();
+    return true;
+  } catch (e) {
+    console.warn("hydrate from server failed; using local cache", e);
+    return false;
+  }
 }
 function loadSettings() {
   try {
@@ -189,6 +309,9 @@ function activeConv() {
   return state.conversations.find(c => c.id === state.activeId);
 }
 function newConv(model, opts = {}) {
+  const wantsPrivate = opts.private != null
+    ? !!opts.private
+    : sessionStorage.getItem(PRIVATE_TOGGLE_KEY) === "1";
   const c = {
     id: newId(),
     title: opts.title || "New chat",
@@ -197,6 +320,7 @@ function newConv(model, opts = {}) {
     parentId: opts.parentId || null,
     createdAt: Date.now(),
   };
+  if (wantsPrivate) c.private = true;
   state.conversations.unshift(c);
   state.activeId = c.id;
   saveConversations();
@@ -228,6 +352,9 @@ async function bootstrap() {
   applyTheme(localStorage.getItem(THEME_KEY) || "dark");
   bindUi();
   await Promise.all([refreshHealth(), refreshModels()]);
+  // Pull server-side conversation history (cross-device sync). Falls back
+  // to the localStorage cache if the gateway is unreachable.
+  await hydrateConversationsFromServer();
   if (!state.conversations.length) newConv();
   if (!state.activeId || !activeConv()) state.activeId = state.conversations[0].id;
   renderConversations();
@@ -393,6 +520,24 @@ function bindUi() {
     });
   }
 
+  const thinkingEl = $("#thinking-toggle");
+  if (thinkingEl) {
+    thinkingEl.checked = localStorage.getItem("provider.thinking.v1") === "1";
+    thinkingEl.addEventListener("change", () => {
+      localStorage.setItem("provider.thinking.v1", thinkingEl.checked ? "1" : "0");
+    });
+  }
+
+  // Private chat toggle: tab-scoped via sessionStorage. When ON, "+ New chat"
+  // creates a conv that is never written to localStorage or the server.
+  const privateEl = $("#private-toggle");
+  if (privateEl) {
+    privateEl.checked = sessionStorage.getItem(PRIVATE_TOGGLE_KEY) === "1";
+    privateEl.addEventListener("change", () => {
+      sessionStorage.setItem(PRIVATE_TOGGLE_KEY, privateEl.checked ? "1" : "0");
+    });
+  }
+
   $("#ing-summarize").addEventListener("click", summarizeAndIngest);
 
   $("#kb-refresh").addEventListener("click", refreshKnowledgeCards);
@@ -529,17 +674,29 @@ function renderConversations() {
     if (c.id === state.activeId) li.classList.add("active");
     const title = document.createElement("span");
     title.className = "title";
-    title.textContent = c.title || "(untitled)";
+    if (c.private) {
+      li.classList.add("private");
+      const lock = document.createElement("span");
+      lock.className = "private-mark";
+      lock.textContent = "🔒 ";
+      lock.title = "Private chat (not synced, will be lost when this tab closes)";
+      title.appendChild(lock);
+      title.appendChild(document.createTextNode(c.title || "(untitled)"));
+    } else {
+      title.textContent = c.title || "(untitled)";
+    }
     const del = document.createElement("button");
     del.className = "del";
     del.textContent = "✕";
     del.title = "Delete conversation";
     del.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      const wasPrivate = !!c.private;
       state.conversations = state.conversations.filter(x => x.id !== c.id);
       if (state.activeId === c.id) state.activeId = state.conversations[0]?.id || null;
       if (!state.activeId) newConv();
       saveConversations();
+      if (!wasPrivate) _deleteConvOnServer(c.id);
       renderConversations();
       renderMessages();
     });
@@ -862,6 +1019,7 @@ async function sendMessage() {
 
   const useRag = $("#rag-toggle").checked;
   const stream = $("#stream-toggle").checked;
+  const useThinking = $("#thinking-toggle")?.checked === true;
   const useTools = $("#tools-toggle")?.checked === true;
   const s = state.settings || {};
 
@@ -880,6 +1038,9 @@ async function sendMessage() {
   }
 
   const body = { model: c.model, messages: apiMessages, stream };
+  if (!useThinking) {
+    body.chat_template_kwargs = { enable_thinking: false };
+  }
   if (Number.isFinite(s.temperature)) body.temperature = s.temperature;
   if (Number.isFinite(s.top_p)) body.top_p = s.top_p;
   if (Number.isFinite(s.top_k)) body.top_k = s.top_k;
@@ -919,7 +1080,7 @@ async function sendMessage() {
   state.streaming = true;
   $("#send").disabled = true;
   $("#stop").hidden = false;
-  $("#composer-meta").textContent = `→ ${c.model}${useRag ? " · RAG" : ""}${stream ? " · streaming" : ""}`;
+  $("#composer-meta").textContent = `→ ${c.model}${useRag ? " · RAG" : ""}${stream ? " · streaming" : ""}${useThinking ? " · thinking" : ""}`;
 
   const t0 = performance.now();
   try {
@@ -1023,7 +1184,7 @@ async function sendMessage() {
           if (elapsed > 0.25) {
             const tps = outTokens / elapsed;
             $("#composer-meta").textContent =
-              `→ ${lastModel}${useRag ? " · RAG" : ""} · ${outTokens} chunks · ${tps.toFixed(1)}/s`;
+              `→ ${lastModel}${useRag ? " · RAG" : ""}${useThinking ? " · thinking" : ""} · ${outTokens} chunks · ${tps.toFixed(1)}/s`;
           }
         }
         return false;

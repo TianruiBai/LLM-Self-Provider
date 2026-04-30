@@ -183,7 +183,7 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
             await lifecycle.shutdown()
 
     app = FastAPI(title="Self-hosted Model Provider", version="0.1.0", lifespan=lifespan)
-    ui_version = "20260430a"
+    ui_version = "20260430c"
     ui_url = f"/ui/?v={ui_version}"
 
     # CORS — allow OpenAI clients from anywhere (VS Code webviews, browser tools, etc.)
@@ -274,6 +274,10 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
     # /auth/oidc router: OIDC sign-in (GitHub + Google + generic).
     from provider.oidc_routes import router as _oidc_router
     app.include_router(_oidc_router)
+
+    # /conversations router: server-side WebUI chat history (cross-device sync).
+    from provider.conversations_routes import router as _conversations_router
+    app.include_router(_conversations_router)
 
     proxy_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
 
@@ -897,6 +901,14 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         # Built-in tool catalog: opt in via body["tools_builtin"] = true.
         # Strip the flag before forwarding so upstream doesn't see it.
         want_builtin_tools = bool(body.pop("tools_builtin", False))
+        client_tool_names: set[str] = set()
+        for tool_def in body.get("tools") or []:
+            try:
+                name = tool_def["function"]["name"]
+            except Exception:
+                continue
+            if isinstance(name, str) and name:
+                client_tool_names.add(name)
         # Optional cap on tool-call hops to prevent runaway loops.
         max_tool_hops = int(body.pop("max_tool_hops", 4) or 4)
         # Per-request attached documents. The client may pass a structured
@@ -917,7 +929,8 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
                     "size": int(d.get("size") or len(d.get("text") or "")),
                 })
         has_docs = bool(request_docs)
-        if want_builtin_tools or has_docs:
+        server_tool_loop_enabled = (want_builtin_tools or has_docs) and not client_tool_names
+        if server_tool_loop_enabled:
             body["tools"] = builtin_tools.merge_tools(
                 body.get("tools"), want_builtin_tools, has_documents=has_docs,
                 has_kb=(rag is not None),
@@ -1042,15 +1055,20 @@ def create_app(cfg: ProviderConfig | None = None) -> FastAPI:
         t0 = time.time()
 
         # ---- server-side tool-call loop ----
-        # If the request advertises any tools (built-in or user-provided), and
-        # the upstream model emits matching tool_calls, we execute them and
-        # re-call upstream with the tool results appended as messages. This
-        # repeats up to `max_tool_hops` times. Once the model produces a final
-        # answer (no more tool_calls), we stream/return that response normally.
+        # Only run this loop for tools that the gateway itself injected
+        # (WebUI built-ins and attached-document tools). OpenAI-compatible IDE
+        # clients such as VS Code Copilot BYOK and Continue send their own
+        # client-side tools (read_file, manage_todo_list, edit tools, etc.).
+        # Per the OpenAI tool-calling flow, those tool_calls must be returned
+        # to the client so the IDE can execute them locally and send tool
+        # results back on the next request.
+        #
+        # This distinction prevents client tools from being converted into
+        # fake server errors like: tool 'manage_todo_list' not available.
         # Streaming is preserved for the FINAL hop only; intermediate hops
         # always run with stream=false because we need to inspect the response.
         executed_calls: list[dict[str, Any]] = []
-        if chat and body.get("tools") and mcfg.kind != "sub_agent":
+        if chat and body.get("tools") and mcfg.kind != "sub_agent" and server_tool_loop_enabled:
             # Make sure upstream sees a proper tool_choice when we have tools.
             body.setdefault("tool_choice", "auto")
             for hop in range(max_tool_hops):

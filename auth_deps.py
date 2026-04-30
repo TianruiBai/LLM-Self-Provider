@@ -185,6 +185,7 @@ class AuthMiddleware:
         "/admin/",
         "/rag/",
         "/events",
+        "/conversations",
         "/auth/me",
         "/auth/logout",
         "/auth/keys",

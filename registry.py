@@ -50,6 +50,7 @@ class ModelConfig:
 @dataclass
 class ServerConfig:
     llama_server_bin: str = ""
+    lmstudio_backend: Literal["native", "container"] = "native"
     host: str = "127.0.0.1"
     chat_port: int = 18001
     embedding_port: int = 18002
@@ -82,7 +83,7 @@ class GatewayConfig:
 
 @dataclass
 class RagConfig:
-    backend: str = "mongo"  # "mongo" | "lance"
+    backend: str = "lance"  # "mongo" | "lance"
     mongo_uri: str = "mongodb://127.0.0.1:27017/?directConnection=true"
     database: str = "provider_rag"
     collection: str = "documents"
@@ -165,7 +166,7 @@ def load_config(path: str | Path | None = None) -> ProviderConfig:
     # elsewhere. Models are *registered* but stay invisible to non-admin
     # users until an admin explicitly publishes them via /admin/models.
     seen_ids = {m.id for m in models}
-    for discovered in _discover_lmstudio(server.lmstudio_dir):
+    for discovered in _discover_lmstudio(server.lmstudio_dir, server.lmstudio_backend):
         if discovered.id in seen_ids:
             continue
         models.append(discovered)
@@ -263,21 +264,29 @@ def _default_lmstudio_dir() -> Path | None:
     return None
 
 
-def _discover_lmstudio(explicit: str | None) -> list[ModelConfig]:
+def _discover_lmstudio(
+    explicit: str | None,
+    backend_mode: Literal["native", "container"] = "native",
+) -> list[ModelConfig]:
     """Walk an LM Studio model cache and register each GGUF as a chat model.
 
     Layout (LM Studio convention):
         <root>/<publisher>/<model_name>/<weights>.gguf
         <root>/<publisher>/<model_name>/mmproj-*.gguf   (optional)
 
-    The first non-``mmproj`` ``.gguf`` per folder becomes the model weight.
-    Resulting id: ``lmstudio/<publisher>/<model_name>``. Multimodal repos
-    that ship an ``mmproj-*.gguf`` are auto-tagged ``kind=vision``.
+        The first non-``mmproj`` ``.gguf`` per folder becomes the model weight.
+        Resulting id: ``lmstudio/<publisher>/<model_name>``. Multimodal repos
+        that ship an ``mmproj-*.gguf`` are auto-tagged ``kind=vision``.
+
+        ``backend_mode`` decides how the discovered entry is wired:
+            * ``native``    -> local subprocess via ``LifecycleManager._spawn``
+            * ``container`` -> sibling Docker runner via ``llama-runner://chat``
     """
     root = Path(explicit) if explicit else _default_lmstudio_dir()
     if root is None or not root.is_dir():
         return []
 
+    endpoint = "llama-runner://chat" if backend_mode == "container" else None
     out: list[ModelConfig] = []
     for publisher in sorted(p for p in root.iterdir() if p.is_dir()):
         for model_dir in sorted(m for m in publisher.iterdir() if m.is_dir()):
@@ -299,13 +308,8 @@ def _discover_lmstudio(explicit: str | None) -> list[ModelConfig]:
                     path=str(weights[0]),
                     mmproj=str(mmproj[0]) if mmproj else None,
                     folder=str(model_dir),
-                    # In-container deployment: GGUFs are run by a swappable
-                    # sibling llama-server container managed by
-                    # ``provider.llama_runner``. The sentinel endpoint tells
-                    # lifecycle to invoke the runner rather than treat it as
-                    # a static URL.
                     backend="llama_cpp",
-                    endpoint="llama-runner://chat",
+                    endpoint=endpoint,
                 )
             )
     if out:

@@ -19,7 +19,7 @@
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/common.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
-<script defer src="/ui/account.js?v=20260430a"></script>
+<script defer src="/ui/account.js?v=20260430c"></script>
 </head>
 <body>
 <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
@@ -87,6 +87,14 @@
             <span>Stream</span>
           </label>
           <label class="switch">
+            <input type="checkbox" id="thinking-toggle" />
+            <span title="Allow reasoning models to spend tokens on reasoning_content before the final answer">Thinking</span>
+          </label>
+          <label class="switch">
+            <input type="checkbox" id="private-toggle" />
+            <span title="Private chat: not synced to your account history; cleared when this tab closes">Private</span>
+          </label>
+          <label class="switch">
             <input type="checkbox" id="tools-toggle" />
             <span title="Server-executed web_search + web_fetch tools">Web tools</span>
           </label>
@@ -139,7 +147,7 @@
       <div class="panel-header">
         <div>
           <h1>Knowledge base</h1>
-          <p class="hint">Documents ingested into MongoDB Atlas Local with vector embeddings. Cards group chunks by
+          <p class="hint">Documents ingested into LanceDB with vector embeddings. Cards group chunks by
             <code>doc_id</code>; the network shows linkage by shared <strong>source</strong> and <strong>tags</strong>.</p>
         </div>
         <div class="kb-stats" id="kb-stats">loading…</div>
@@ -293,6 +301,6 @@
   </form>
 </dialog>
 
-<script src="/ui/app.js?v=20260430a"></script>
+<script src="/ui/app.js?v=20260430c"></script>
 </body>
 </html>

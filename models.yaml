@@ -12,7 +12,10 @@ server:
   # CUDA backend handles MoE offload + KV pinning more reliably on this rig.
   # CUDA0 = RTX 4070 Laptop (8 GiB) -> embedder + sub-agent.
   # CUDA1 = RTX PRO 4000 Blackwell SFF (24 GiB) -> swappable chat models.
-  llama_server_bin: "C:/Users/Tass/Documents/DS-V4-llama/llama.cpp/build-cuda/bin/Release/llama-server.exe"
+  llama_server_bin: "C:/Users/Tass/Documents/DS-V4-llama/llama.cpp-deepseek-v4-flash/build-cuda-ds4/bin/Release/llama-server.exe"
+  # Native deployment: auto-discovered LM Studio models are launched as
+  # local llama-server subprocesses on the host, not via Docker.
+  lmstudio_backend: native
   host: "127.0.0.1"
   chat_port: 18001        # rotating port used by the active chat model
   embedding_port: 18002   # persistent port for the embedder
@@ -37,10 +40,8 @@ gateway:
   port: 8000
 
 rag:
-  mongo_uri: "mongodb://127.0.0.1:27017/?directConnection=true"
-  database: "provider_rag"
-  collection: "documents"
-  vector_index: "vector_index"
+  backend: lance
+  lance_dir: "data/lance"
   embedding_dim: 4096       # Qwen3-Embedding-8B output dimensionality
   default_top_k: 4
   chunk_chars: 1200
